@@ -19,6 +19,8 @@ const GLOBAL_BAR_ID = '#impeccable-live-global-bar';
 const PICKER_ID = '#impeccable-live-picker';
 const EDIT_BADGE_ID = '#impeccable-live-edit-badge';
 const PENDING_DOCK_ID = '#impeccable-live-pending-dock';
+// The Apply pill is the only dock button carrying data-count; its label copy changes.
+const APPLY_PILL = 'button[data-count]';
 // The configure-row submit button is icon-only; its accessible name is the
 // only stable handle (see buildConfigureSubmitButton in live-browser.js).
 const GO_BUTTON_ARIA_LABEL = 'Generate variants';
@@ -34,6 +36,7 @@ const DETECT_BADGE = '#impeccable-live-detect-badge';
 const DESIGN_TOGGLE = '#impeccable-live-design-toggle';
 const DESIGN_HOST = '#impeccable-live-design-host';
 const EXIT_BUTTON = '#impeccable-live-exit';
+const CONFIGURE_INPUT_ID = '#impeccable-live-input';
 const INSERT_INPUT_ID = '#impeccable-live-insert-input';
 const INSERT_CREATE_ID = '#impeccable-live-insert-create';
 const ANNOTATION_ID = '#impeccable-live-annot';
@@ -524,6 +527,28 @@ async function resetPickMode(page) {
 }
 
 /**
+ * Type the configure prompt the way a user does. The bar focuses its input
+ * after a pick, so the keys land wherever focus really is: a host focus trap
+ * that pulls focus back into its modal fails this (issue #851).
+ */
+export async function typeConfigurePrompt(page, prompt) {
+  await page.waitForFunction(
+    (sel) => {
+      const input = window.__impeccableLiveQuery(sel);
+      return Boolean(input) && window.__IMPECCABLE_LIVE_CHROME_CORE__?.activeElementDeep?.() === input;
+    },
+    CONFIGURE_INPUT_ID,
+    { timeout: 5_000 },
+  );
+  await page.keyboard.type(prompt);
+  await page.waitForFunction(
+    ({ sel, value }) => window.__impeccableLiveQuery(sel)?.value === value,
+    { sel: CONFIGURE_INPUT_ID, value: prompt },
+    { timeout: 5_000 },
+  );
+}
+
+/**
  * Set the variant count by clicking the count button (cycles 2 → 3 → 4 → 2).
  * Default is 3. If the desired count is already showing, this is a no-op.
  */
@@ -606,6 +631,35 @@ export async function clickGo(page) {
 }
 
 /**
+ * The generating shader is the visible loader: a frozen capture of the
+ * original painted over the target while variants are being written. Every
+ * transition into CYCLING has to take it down, so a cycling bar with the
+ * shader still up is the stuck loader from issue #719, not a cosmetic
+ * detail. The transition is synchronous, so a short window is generous.
+ */
+async function assertGeneratingShaderCleared(page) {
+  const stillUp = await page
+    .waitForFunction(
+      () => !(window.__impeccableLiveQuery || document.querySelector.bind(document))('#impeccable-live-shader'),
+      undefined,
+      { timeout: 5_000 },
+    )
+    .then(() => false)
+    .catch(() => true);
+  if (stillUp) {
+    const err = new Error(
+      'CYCLING reached but the generating shader overlay (#impeccable-live-shader) is still up: '
+      + 'the loader never handed off to the variant cycler',
+    );
+    // Cycling was reached, so the recovery paths in waitForCyclingRobust
+    // (retrace preActions, reload) have nothing to recover and a reload would
+    // hide the defect by taking the shader down with the page.
+    err.impeccableNoRetry = true;
+    throw err;
+  }
+}
+
+/**
  * Wait for the bar to enter CYCLING state — happens after the agent's
  * variants land in the DOM via HMR and the MutationObserver counts them.
  *
@@ -636,6 +690,7 @@ export async function waitForCycling(page, expectedCount, { timeout = 30_000 } =
     { barSel: BAR_ID, expected: expectedCount },
     { timeout },
     );
+    await assertGeneratingShaderCleared(page);
   } catch (err) {
     if (process.env.IMPECCABLE_E2E_DEBUG) {
       const snapshot = await page.evaluate((barSel) => {
@@ -672,6 +727,62 @@ export async function clickNext(page) {
 
 export async function clickPrev(page) {
   await clickBarButton(page, '←');
+}
+
+/**
+ * Wait until one variant step has fully landed: the bar counter, the bar's own
+ * notion of the visible variant, and (on component previews) the variant that
+ * is actually mounted all agree.
+ *
+ * Reading the counter alone is not enough. The counter can still show the
+ * previous step when the next click goes out, and two clicks that arrive
+ * inside one settle window leave the session on a variant nobody asked for.
+ */
+export async function waitForVariantSettled(page, expected, count, { timeout = 15_000 } = {}) {
+  await installLiveQueryHelpers(page);
+  try {
+    await page.waitForFunction(
+      ({ expected, count, barSel }) => {
+        const bar = window.__impeccableLiveQuery(barSel);
+        if (!bar || !(bar.textContent || '').includes(`${expected}/${count}`)) return false;
+        const debugState = window.__IMPECCABLE_LIVE_CHROME_CORE__?.debugState?.();
+        if (!debugState) return true;
+        if (debugState.visibleVariant !== expected) return false;
+        if (debugState.hasSvelteComponentSession && debugState.mountedSvelteVariant !== expected) return false;
+        return true;
+      },
+      { expected, count, barSel: BAR_ID },
+      { timeout },
+    );
+  } catch (err) {
+    const debugState = await page
+      .evaluate(() => window.__IMPECCABLE_LIVE_CHROME_CORE__?.debugState?.() || null)
+      .catch(() => null);
+    throw new Error(
+      `variant ${expected}/${count} never settled; debugState=${JSON.stringify(debugState)} (${err.message})`,
+    );
+  }
+}
+
+/**
+ * Step the comparison to `targetVariant`, one settled click at a time.
+ * Returns the variant now visible.
+ */
+export async function cycleToVariant(page, targetVariant, count, { settleTimeout = 15_000 } = {}) {
+  let visible = await getVisibleVariant(page);
+  let steps = 0;
+  while (visible !== targetVariant) {
+    if (steps++ > count + 6) {
+      throw new Error(`variant ${targetVariant} did not become visible; last visible=${visible}`);
+    }
+    const forward = visible == null || visible < targetVariant;
+    const next = visible == null ? 1 : (forward ? visible + 1 : visible - 1);
+    if (forward) await clickNext(page);
+    else await clickPrev(page);
+    await waitForVariantSettled(page, next, count, { timeout: settleTimeout });
+    visible = await getVisibleVariant(page);
+  }
+  return visible;
 }
 
 function barButtonMatch(label) {
@@ -767,6 +878,208 @@ export async function getVisibleVariant(page) {
   } catch {
     return null;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Tune popover
+//
+// buildParamsPanel renders one row per param with no stable ids: a label row
+// (label span + readout span) followed by the control (range input, toggle
+// track button, or a segmented row of buttons). The label text is the only
+// handle a user has too, so that is what these helpers match on.
+// ---------------------------------------------------------------------------
+
+const TUNE_BUTTON = '[data-iceq-tune="1"]';
+const PARAMS_PANEL_ID = '#impeccable-live-params-panel';
+
+/** Open the Tune popover and wait for its rows to render. */
+export async function openTunePanel(page, { timeout = 5_000 } = {}) {
+  await installLiveQueryHelpers(page);
+  await page.waitForFunction(
+    (sel) => {
+      const tune = window.__impeccableLiveQuery(sel);
+      return Boolean(tune) && tune.disabled === false;
+    },
+    TUNE_BUTTON,
+    { timeout },
+  );
+  await clickLiveControl(page, TUNE_BUTTON);
+  await page.waitForFunction(
+    (sel) => (window.__impeccableLiveQuery(sel)?.querySelectorAll(':scope > div > div').length || 0) > 0,
+    PARAMS_PANEL_ID,
+    { timeout },
+  );
+}
+
+/** Close Tune without changing variants or accepting the current choice. */
+export async function closeTunePanel(page) {
+  await installLiveQueryHelpers(page);
+  const alreadyClosed = await page.evaluate(
+    (sel) => window.__impeccableLiveQuery(sel)?.style.pointerEvents === 'none',
+    PARAMS_PANEL_ID,
+  );
+  if (alreadyClosed) return;
+  await clickLiveControl(page, TUNE_BUTTON);
+  await page.waitForFunction(
+    (sel) => window.__impeccableLiveQuery(sel)?.style.pointerEvents === 'none',
+    PARAMS_PANEL_ID,
+    { timeout: 5_000 },
+  );
+}
+
+/**
+ * Drag a `range` knob to `value`. Setting `.value` + dispatching `input` is
+ * what a real drag produces; the panel's listener reads the input, not the
+ * event, so this exercises the same code path.
+ */
+export async function setTuneRange(page, label, value) {
+  await installLiveQueryHelpers(page);
+  const applied = await page.evaluate(({ panelSel, label, value }) => {
+    const panel = window.__impeccableLiveQuery(panelSel);
+    const row = [...(panel?.querySelectorAll(':scope > div > div') || [])]
+      .find((candidate) => candidate.querySelector('span')?.textContent?.trim() === label);
+    const input = row?.querySelector('input[type="range"]');
+    if (!input) return null;
+    input.value = String(value);
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    return parseFloat(input.value);
+  }, { panelSel: PARAMS_PANEL_ID, label, value });
+  if (applied == null) {
+    throw new Error(`Tune range "${label}" not found. ${await describeTunePanel(page)}`);
+  }
+  return applied;
+}
+
+/** Panel contents + variant state, for failures that would otherwise be mute. */
+async function describeTunePanel(page) {
+  const snapshot = await page.evaluate((panelSel) => {
+    const panel = window.__impeccableLiveQuery(panelSel);
+    const rows = [...(panel?.querySelectorAll(':scope > div > div') || [])]
+      .map((row) => (row.querySelector('span')?.textContent || '').trim());
+    const debugState = window.__IMPECCABLE_LIVE_CHROME_CORE__?.debugState?.() || null;
+    return {
+      rows,
+      barText: debugState?.barText || null,
+      visibleVariant: debugState?.visibleVariant ?? null,
+      mountedSvelteVariant: debugState?.mountedSvelteVariant ?? null,
+      state: debugState?.state || null,
+    };
+  }, PARAMS_PANEL_ID).catch((err) => ({ error: err.message }));
+  return `Panel snapshot: ${JSON.stringify(snapshot)}`;
+}
+
+/** Click one option of a `steps` param by its visible option label. */
+export async function chooseTuneStep(page, label, optionLabel) {
+  await installLiveQueryHelpers(page);
+  const clicked = await page.evaluate(({ panelSel, label, optionLabel }) => {
+    const panel = window.__impeccableLiveQuery(panelSel);
+    const row = [...(panel?.querySelectorAll(':scope > div > div') || [])]
+      .find((candidate) => candidate.querySelector('span')?.textContent?.trim() === label);
+    if (!row) return 'no-row';
+    const button = [...row.querySelectorAll('button')]
+      .find((btn) => (btn.textContent || '').trim() === optionLabel);
+    if (!button) return 'no-option';
+    button.click();
+    return 'ok';
+  }, { panelSel: PARAMS_PANEL_ID, label, optionLabel });
+  if (clicked !== 'ok') {
+    throw new Error(`Tune steps "${label}" option "${optionLabel}" not found (${clicked})`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Mount-error card (component previews)
+// ---------------------------------------------------------------------------
+
+const MOUNT_ERROR_ID = '#impeccable-live-mount-error';
+const MOUNT_RETRY = '[data-impeccable-mount-retry="true"]';
+
+/** Wait for the persistent mount-error card and return its text. */
+export async function waitForMountErrorCard(page, { variant, timeout = 20_000 } = {}) {
+  await installLiveQueryHelpers(page);
+  await page.waitForFunction(
+    ({ sel, variant }) => {
+      const card = window.__impeccableLiveQuery(sel);
+      if (!card) return false;
+      if (variant == null) return true;
+      return (card.textContent || '').includes(`Variant ${variant} failed to load`);
+    },
+    { sel: MOUNT_ERROR_ID, variant: variant ?? null },
+    { timeout },
+  );
+  return page.evaluate((sel) => window.__impeccableLiveQuery(sel)?.textContent || '', MOUNT_ERROR_ID);
+}
+
+export async function isMountErrorCardVisible(page) {
+  await installLiveQueryHelpers(page);
+  return page.evaluate((sel) => Boolean(window.__impeccableLiveQuery(sel)), MOUNT_ERROR_ID);
+}
+
+/** Click the card's Retry button (re-imports the manifest's current revision). */
+export async function clickMountRetry(page) {
+  await installLiveQueryHelpers(page);
+  const clicked = await page.evaluate(({ cardSel, retrySel }) => {
+    const button = window.__impeccableLiveQuery(cardSel)?.querySelector(retrySel);
+    if (!button) return false;
+    button.click();
+    return true;
+  }, { cardSel: MOUNT_ERROR_ID, retrySel: MOUNT_RETRY });
+  if (!clicked) throw new Error('mount-error Retry button not found');
+}
+
+export async function waitForMountErrorCardGone(page, { timeout = 20_000 } = {}) {
+  await installLiveQueryHelpers(page);
+  await page.waitForFunction(
+    (sel) => !window.__impeccableLiveQuery(sel),
+    MOUNT_ERROR_ID,
+    { timeout },
+  );
+}
+
+/**
+ * Wait until the picked element renders with `expected` computed font-weight.
+ * The fake agent gives every variant a distinct weight, so this is the render
+ * proof that variant N actually mounted (see FAKE_VARIANT_FONT_WEIGHTS).
+ */
+export async function waitForComputedFontWeight(page, selector, expected, { timeout = 10_000 } = {}) {
+  try {
+    await page.waitForFunction(
+      ({ sel, expected }) => {
+        const query = window.__impeccableLiveQuery || ((s) => document.querySelector(s));
+        const el = query(sel) || document.querySelector(sel);
+        return Boolean(el) && getComputedStyle(el).fontWeight === expected;
+      },
+      { sel: selector, expected: String(expected) },
+      { timeout },
+    );
+  } catch (err) {
+    const snapshot = await page.evaluate((sel) => {
+      const el = document.querySelector(sel);
+      const debugState = window.__IMPECCABLE_LIVE_CHROME_CORE__?.debugState?.() || null;
+      const mount = document.querySelector('[data-impeccable-component-mount]');
+      return {
+        found: Boolean(el),
+        fontWeight: el ? getComputedStyle(el).fontWeight : null,
+        outerHTML: el?.outerHTML?.slice(0, 400) || null,
+        mountHTML: mount?.outerHTML?.slice(0, 400) || null,
+        barText: debugState?.barText || null,
+        state: debugState?.state || null,
+        visibleVariant: debugState?.visibleVariant ?? null,
+        mountedSvelteVariant: debugState?.mountedSvelteVariant ?? null,
+      };
+    }, selector).catch((snapErr) => ({ error: snapErr.message }));
+    throw new Error(
+      `expected computed font-weight ${expected} on ${selector}; snapshot: ${JSON.stringify(snapshot)} (${err.message})`,
+    );
+  }
+}
+
+export async function readComputedFontWeight(page, selector) {
+  return page.evaluate((sel) => {
+    const query = window.__impeccableLiveQuery || ((s) => document.querySelector(s));
+    const el = query(sel) || document.querySelector(sel);
+    return el ? getComputedStyle(el).fontWeight : null;
+  }, selector);
 }
 
 /**
@@ -875,52 +1188,45 @@ async function clickEditBadgeButton(page, label) {
 
 export async function assertApplyDockVisible(page, expectedCount, { timeout = 5_000 } = {}) {
   await page.waitForFunction(
-    ({ dockSel, expected }) => {
+    ({ dockSel, pillSel, expected }) => {
       const dock = window.__impeccableLiveQuery(dockSel);
       if (!dock || dock.style.display === 'none') return false;
-      const pill = [...dock.querySelectorAll('button')].find((btn) =>
-        /Apply copy edit/.test(btn.textContent || '')
-      );
+      const pill = dock.querySelector(pillSel);
       if (!pill || pill.style.display === 'none') return false;
       if (expected == null) return true;
       return parseInt(pill.dataset.count || '0', 10) === expected;
     },
-    { dockSel: PENDING_DOCK_ID, expected: expectedCount },
+    { dockSel: PENDING_DOCK_ID, pillSel: APPLY_PILL, expected: expectedCount },
     { timeout },
   );
 }
 
 export async function waitForApplyDockHidden(page, { timeout = 10_000 } = {}) {
   await page.waitForFunction(
-    (dockSel) => {
+    ({ dockSel, pillSel }) => {
       const dock = window.__impeccableLiveQuery(dockSel);
       if (!dock || dock.style.display === 'none') return true;
-      const pill = [...dock.querySelectorAll('button')].find((btn) =>
-        /Apply copy edit/.test(btn.textContent || '')
-      );
+      const pill = dock.querySelector(pillSel);
       return !pill || pill.style.display === 'none' || parseInt(pill.dataset.count || '0', 10) === 0;
     },
-    PENDING_DOCK_ID,
+    { dockSel: PENDING_DOCK_ID, pillSel: APPLY_PILL },
     { timeout },
   );
 }
 
 export async function assertApplyDockLoading(page, { timeout = 5_000 } = {}) {
   await page.waitForFunction(
-    (dockSel) => {
+    ({ dockSel, pillSel }) => {
       const dock = window.__impeccableLiveQuery(dockSel);
       if (!dock || dock.style.display === 'none') return false;
-      const pill = [...dock.querySelectorAll('button')].find((btn) =>
-        /Apply copy edit|Applying|Verifying|Fixing apply issue/.test(btn.textContent || '')
-      );
+      const pill = dock.querySelector(pillSel);
       if (!pill) return false;
       const spinner = dock.querySelector('[aria-hidden="true"]');
-      return pill.disabled === true
-        || pill.getAttribute('aria-busy') === 'true'
+      return pill.getAttribute('aria-busy') === 'true'
         || /Applying|Verifying|Fixing apply issue/.test(pill.textContent || '')
         || spinner?.style?.display === 'inline-block';
     },
-    PENDING_DOCK_ID,
+    { dockSel: PENDING_DOCK_ID, pillSel: APPLY_PILL },
     { timeout },
   );
 }
@@ -929,7 +1235,7 @@ export async function clickApplyEdits(page) {
   const dialog = page.waitForEvent('dialog', { timeout: 5_000 })
     .then((d) => d.accept())
     .catch(() => {});
-  await page.locator(`${PENDING_DOCK_ID} button`, { hasText: /Apply copy edit/ }).click({ timeout: 5_000 });
+  await page.locator(`${PENDING_DOCK_ID} ${APPLY_PILL}`).click({ timeout: 5_000 });
   await dialog;
 }
 

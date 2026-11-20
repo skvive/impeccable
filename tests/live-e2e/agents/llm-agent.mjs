@@ -36,6 +36,12 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.join(__dirname, '..', '..', '..');
 const LIVE_MD_PATH = path.join(REPO_ROOT, 'skill', 'reference', 'live.md');
 
+// Frontier default: gpt-5.6-terra at medium reasoning effort. Haiku stayed
+// too far below the models that actually drive live sessions in the field;
+// a spec change Haiku tolerates can still confuse or be confused by the
+// frontier tier, so the harness should exercise the tier users run.
+const DEFAULT_OPENAI_MODEL = 'gpt-5.6-terra';
+const DEFAULT_OPENAI_REASONING_EFFORT = 'medium';
 const DEFAULT_ANTHROPIC_MODEL = 'claude-haiku-4-5';
 // DeepSeek model list: https://api-docs.deepseek.com/api/list-models
 const DEFAULT_DEEPSEEK_MODEL = 'deepseek-v4-flash';
@@ -77,7 +83,7 @@ export const VARIANT_SYSTEM_INSTRUCTIONS = [
   '- Replace mode: for bare text elements, keep the full visible copy in one editable text node. If you add child markup for styling, wrap the entire copy; never split the copy across sibling text nodes.',
   '- Replace mode: PRESERVE existing class-bearing descendant elements in place. If the picked element contains <h1 class="hero-title"> and <p class="hero-hook">, keep those elements/classes as direct descendants of the replacement root; do not wrap them in a new structural div such as <div class="hero-inner">.',
   '- Replace mode: Do not return source-identical variants. For a bare text element, preserve the root tag/class/copy but add a small child span or styling hook so Accept persists a real source change.',
-  '- Replace mode: for non-bare elements where the existing children must stay in place, add a harmless root attribute such as data-impeccable-e2e-variant="1" or another non-copy styling hook so the markup is materially changed without changing visible text.',
+  '- Replace mode: for non-bare elements where the existing children must stay in place, add a permanent styling hook such as data-design-variant="1" so the markup is materially changed without changing visible text. Never invent data-impeccable-* attributes: that namespace is reserved for temporary runtime state.',
   '- Generate exactly event.count variants — no more, no fewer.',
   '- Mix the param kinds across the variant set: include at least one range, one steps, and one toggle when count >= 3.',
   '- The scopedCss must follow wrapInfo.cssAuthoring exactly: use its selector strategy, rulePattern, requirements, and forbidden patterns.',
@@ -199,6 +205,17 @@ const STEER_SYSTEM_INSTRUCTIONS = [
 export function resolveLlmAgentConfig(opts = {}, env = process.env) {
   const provider = resolveProvider(opts, env);
 
+  if (provider === 'openai') {
+    return {
+      provider,
+      model: opts.model || env.IMPECCABLE_E2E_LLM_MODEL || DEFAULT_OPENAI_MODEL,
+      apiKey: opts.apiKey || env.OPENAI_API_KEY,
+      requiredEnv: 'OPENAI_API_KEY',
+      baseURL: opts.baseURL || env.OPENAI_BASE_URL,
+      reasoningEffort: opts.reasoningEffort || env.IMPECCABLE_E2E_LLM_EFFORT || DEFAULT_OPENAI_REASONING_EFFORT,
+    };
+  }
+
   if (provider === 'anthropic') {
     return {
       provider,
@@ -225,9 +242,62 @@ export function resolveLlmAgentConfig(opts = {}, env = process.env) {
 function resolveProvider(opts, env) {
   const explicit = opts.provider || env.IMPECCABLE_E2E_LLM_PROVIDER;
   if (explicit) return String(explicit).trim().toLowerCase();
+  if (env.OPENAI_API_KEY) return 'openai';
   if (env.ANTHROPIC_API_KEY) return 'anthropic';
   if (env.DEEPSEEK_API_KEY) return 'deepseek';
-  return 'anthropic';
+  return 'openai';
+}
+
+export function llmRequestSettings(provider) {
+  // DeepSeek defaults to high-effort thinking, which can consume the entire
+  // bounded response before emitting the JSON these edit tests exercise.
+  // Low effort retains planning for the full live spec without inheriting
+  // the provider's high-effort default.
+  // https://api-docs.deepseek.com/guides/thinking_mode/
+  return provider === 'deepseek'
+    ? { thinking: { type: 'enabled' }, output_config: { effort: 'low' } }
+    : {};
+}
+
+/**
+ * Anthropic-SDK-shaped shim over the `ai` SDK for OpenAI models, so the
+ * three text-only call sites in this file stay provider-agnostic. system
+ * blocks are joined (OpenAI caches long prefixes automatically; the
+ * cache_control marker is Anthropic-specific), temperature is omitted
+ * (reasoning models reject it), and the reasoning effort rides through
+ * providerOptions.
+ */
+async function createOpenAiShim({ apiKey, baseURL, reasoningEffort, }) {
+  const [{ generateText }, { createOpenAI }] = await Promise.all([
+    import('ai'),
+    import('@ai-sdk/openai'),
+  ]);
+  const provider = createOpenAI({ apiKey, ...(baseURL ? { baseURL } : {}) });
+  return {
+    messages: {
+      async create({ model, system, messages, max_tokens }, { timeout } = {}) {
+        const systemText = Array.isArray(system)
+          ? system.map((block) => block?.text || '').filter(Boolean).join('\n\n')
+          : String(system || '');
+        const result = await generateText({
+          model: provider(model),
+          system: systemText,
+          messages: messages.map((m) => ({ role: m.role, content: String(m.content) })),
+          maxOutputTokens: max_tokens,
+          abortSignal: timeout ? AbortSignal.timeout(timeout) : undefined,
+          providerOptions: { openai: { reasoningEffort } },
+        });
+        return {
+          content: [{ type: 'text', text: result.text }],
+          usage: {
+            input_tokens: result.usage?.inputTokens ?? 0,
+            output_tokens: result.usage?.outputTokens ?? 0,
+            cache_read_input_tokens: result.usage?.cachedInputTokens ?? 0,
+          },
+        };
+      },
+    },
+  };
 }
 
 /**
@@ -242,7 +312,9 @@ export async function createLlmAgent(opts = {}) {
   const log = opts.log || (() => {});
 
   const liveMd = opts.includeLiveSpec === false ? null : await fs.readFile(LIVE_MD_PATH, 'utf-8');
-  const client = new Anthropic({ apiKey, ...(baseURL ? { baseURL } : {}) });
+  const client = provider === 'openai'
+    ? await createOpenAiShim({ apiKey, baseURL, reasoningEffort: config.reasoningEffort })
+    : new Anthropic({ apiKey, ...(baseURL ? { baseURL } : {}) });
   const systemBlocks = (instructions) => [
     {
       type: 'text',
@@ -270,8 +342,10 @@ export async function createLlmAgent(opts = {}) {
         try {
           response = await client.messages.create(
             {
+              ...llmRequestSettings(provider),
               model,
-              temperature: 0,
+              // Anthropic API 2026-10-21 rejects sampling parameters.
+              ...(provider === 'anthropic' ? {} : { temperature: 0 }),
               max_tokens: 16000,
               // When present, live.md is the final cacheable stable prefix.
               // Benchmarks omit it so external payloads contain only the
@@ -415,8 +489,9 @@ export async function createLlmAgent(opts = {}) {
         try {
           response = await client.messages.create(
             {
+              ...llmRequestSettings(provider),
               model,
-              temperature: 0,
+              ...(provider === 'anthropic' ? {} : { temperature: 0 }),
               max_tokens: 16000,
               system: systemBlocks(MANUAL_EDIT_SYSTEM_INSTRUCTIONS),
               messages: [{ role: 'user', content: userMessage }],
@@ -544,11 +619,15 @@ export async function createLlmAgent(opts = {}) {
       ].join('\n');
 
       const response = await client.messages.create({
+        ...llmRequestSettings(provider),
         model,
         max_tokens: 4096,
         system: systemBlocks(STEER_SYSTEM_INSTRUCTIONS),
         messages: [{ role: 'user', content: userMessage }],
-      });
+      }, provider === 'deepseek' ? {
+        maxRetries: LLM_REQUEST_MAX_RETRIES,
+        timeout: MANUAL_EDIT_REQUEST_TIMEOUT_MS,
+      } : {});
 
       const cacheRead = response.usage?.cache_read_input_tokens ?? 0;
       const inputTokens = response.usage?.input_tokens ?? 0;

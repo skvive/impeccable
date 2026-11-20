@@ -6,8 +6,10 @@
 
 export const SKILL_CATEGORIES = {
   // CREATE - build something new
+  // craft is deliberately unmapped: it is a deprecated compatibility alias
+  // (see the router table), and a command without a category stays out of
+  // the generated argument-hint while continuing to route.
   impeccable: 'create',
-  craft: 'create',
   shape: 'create',
   // EVALUATE - review and assess
   critique: 'evaluate',
@@ -35,6 +37,7 @@ export const SKILL_CATEGORIES = {
   document: 'system',
   extract: 'system',
   live: 'system',
+  generate: 'system',
 };
 
 export const CATEGORY_ORDER = ['create', 'evaluate', 'refine', 'simplify', 'harden', 'system'];

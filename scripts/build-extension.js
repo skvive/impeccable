@@ -3,89 +3,140 @@
 /**
  * Builds the browser DevTools extension (Chrome + Firefox).
  *
- * 1. Generates the extension variant of the browser detector
- * 2. Extracts antipatterns.json for the panel UI
- * 3. Packages extension.zip (Chrome Web Store) and extension-firefox.zip (AMO)
+ * 1. Builds the five generated detector pieces (core.js, core_bg.wasm,
+ *    snapshot.js, overlay.js, antipatterns.json) into extension/detector/ by
+ *    running `cargo xtask bundle`, which compiles the rule core to
+ *    WebAssembly and concatenates it with the page JS in browser-bundle/.
+ * 2. Checks that every path the manifest and the service worker reference
+ *    exists in extension/.
+ * 3. Packages, from the one source (scripts/lib/extension-manifests.js):
+ *    - extension.zip: "Impeccable" for the Chrome Web Store: the detector and
+ *      walks, held to the web app's production hosts, with the account left
+ *      out. Unpacked, it is extension/ itself.
+ *    - extension-firefox.zip: the detector for AMO. Firefox cannot drive a
+ *      tab through the debugger, so it has no walks.
  *
- * The source `extension/manifest.json` is the Chrome manifest. The Firefox
- * variant is derived at build time: the MV3 background service worker is
- * declared as an event-page `scripts` entry (the universally-supported path on
- * Gecko), and `browser_specific_settings.gecko` is added for AMO signing.
+ * The Firefox manifest declares the detector's background worker as an
+ * event-page `scripts` entry (the universally-supported path on Gecko), and
+ * `browser_specific_settings.gecko` is added for AMO signing.
+ *
+ * Chrome hosts the WebAssembly rule core in an offscreen document; Firefox
+ * loads the same document in a hidden iframe inside its background event page.
+ *
+ * Needs a Rust toolchain and wasm-pack for step 1. CI matrices that already
+ * ran `cargo xtask bundle` can skip it with IMPECCABLE_EXTENSION_SKIP_BUNDLE=1,
+ * which is honored only when extension/detector/ already holds all five pieces.
  *
  * Run: node scripts/build-extension.js
  */
 
+import { execSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { ANTIPATTERNS } from '../cli/engine/registry/antipatterns.mjs';
+import { DETECTOR_WORKER, moduleReferences, stageFirefox, stageStore } from './lib/extension-manifests.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
 const EXT_DIR = path.join(ROOT, 'extension');
+const DETECTOR_DIR = path.join(EXT_DIR, 'detector');
 
-const BROWSER_MODULES = [
-  'cli/engine/shared/constants.mjs',
-  'cli/engine/registry/antipatterns.mjs',
-  'cli/engine/shared/color.mjs',
-  'cli/engine/shared/fonts.mjs',
-  'cli/engine/rules/checks.mjs',
-  'cli/engine/browser/injected/index.mjs',
-];
-const DETECTOR_OUTPUT = path.join(EXT_DIR, 'detector/detect.js');
-const AP_OUTPUT = path.join(EXT_DIR, 'detector/antipatterns.json');
+// --- 1. Build the detector pieces (cargo xtask bundle) ---
 
-function browserSafeModule(relPath) {
-  let code = fs.readFileSync(path.join(ROOT, relPath), 'utf-8');
-  if (relPath === 'cli/engine/registry/antipatterns.mjs') {
-    const match = code.match(/const ANTIPATTERNS = \[[\s\S]*?\n\];/);
-    if (!match) throw new Error('Could not extract browser antipattern registry');
-    code = match[0];
-  }
-  code = code.replace(/^import[\s\S]*?;\n/gm, '');
-  code = code.replace(/^export\s+\{[^}]*\};\n?/gm, '');
-  code = code.replace(/^export\s+\{[\s\S]*?^};\n?/gm, '');
-  return `// --- ${relPath} ---\n${code.trim()}\n`;
+/** The five generated pieces the extension shell loads. */
+const DETECTOR_PIECES = ['core.js', 'core_bg.wasm', 'snapshot.js', 'overlay.js', 'antipatterns.json'];
+
+const havePieces = DETECTOR_PIECES.every((piece) => fs.existsSync(path.join(DETECTOR_DIR, piece)));
+if (process.env.IMPECCABLE_EXTENSION_SKIP_BUNDLE === '1' && havePieces) {
+  console.log('Skipping `cargo xtask bundle` (IMPECCABLE_EXTENSION_SKIP_BUNDLE=1, extension/detector/ is complete)');
+} else {
+  console.log('Building extension/detector/ with `cargo xtask bundle` ...');
+  execSync('cargo xtask bundle', { cwd: ROOT, stdio: 'inherit' });
 }
 
-const code = BROWSER_MODULES.map(browserSafeModule).join('\n');
+const missingPieces = DETECTOR_PIECES.filter((piece) => !fs.existsSync(path.join(DETECTOR_DIR, piece)));
+if (missingPieces.length) {
+  throw new Error(
+    `extension/detector/ is missing generated piece(s) after the bundle step:\n` +
+      missingPieces.map((p) => `  \u00b7 ${p}`).join('\n'),
+  );
+}
+const totalKb =
+  DETECTOR_PIECES.reduce((sum, piece) => sum + fs.statSync(path.join(DETECTOR_DIR, piece)).size, 0) / 1024;
+console.log(`Built ${DETECTOR_PIECES.length} detector pieces into extension/detector/ (${totalKb.toFixed(1)} KB)`);
 
-// --- 1. Build detector ---
+const ruleCount = JSON.parse(fs.readFileSync(path.join(DETECTOR_DIR, 'antipatterns.json'), 'utf-8')).length;
+console.log(`  antipatterns.json: ${ruleCount} rules`);
 
-const output = `/**
- * Anti-Pattern Browser Detector for Impeccable (Extension Variant)
- * Copyright (c) 2026 Paul Bakaus
- * SPDX-License-Identifier: Apache-2.0
- *
- * GENERATED -- do not edit. Source: cli/engine/browser/injected/index.mjs
- * Rebuild: node scripts/build-extension.js
+// --- 2. Referenced-file check ---
+
+const chromeManifest = JSON.parse(fs.readFileSync(path.join(EXT_DIR, 'manifest.json'), 'utf-8'));
+
+const serviceWorker = chromeManifest.background?.service_worker;
+if (!serviceWorker) {
+  throw new Error(
+    'extension/manifest.json: expected background.service_worker to derive the Firefox manifest',
+  );
+}
+
+/** Every extension-relative path the manifest declares. */
+function manifestReferences(manifest) {
+  const refs = [];
+  const add = (value) => { if (typeof value === 'string' && value) refs.push(value.replace(/^\//, '')); };
+  add(manifest.background?.service_worker);
+  for (const script of manifest.background?.scripts || []) add(script);
+  add(manifest.devtools_page);
+  add(manifest.side_panel?.default_path);
+  add(manifest.action?.default_popup);
+  add(manifest.options_ui?.page);
+  for (const icon of Object.values(manifest.action?.default_icon || {})) add(icon);
+  for (const icon of Object.values(manifest.icons || {})) add(icon);
+  for (const entry of manifest.content_scripts || []) {
+    for (const file of entry.js || []) add(file);
+    for (const file of entry.css || []) add(file);
+  }
+  for (const entry of manifest.web_accessible_resources || []) {
+    for (const resource of entry.resources || []) add(resource);
+  }
+  return refs;
+}
+
+/**
+ * The service worker injects the content script and its generated companions
+ * by path and opens the offscreen document by path, so those files are
+ * referenced without appearing in the manifest.
  */
-(function () {
-if (typeof window === 'undefined') return;
-${code}
-})();
-`;
+function serviceWorkerReferences(source) {
+  const refs = [];
+  const offscreen = source.match(/OFFSCREEN_URL\s*=\s*['"]([^'"]+)['"]/);
+  if (offscreen) refs.push(offscreen[1]);
+  for (const block of source.matchAll(/files:\s*\[([^\]]*)\]/g)) {
+    for (const file of block[1].matchAll(/['"]([^'"]+)['"]/g)) refs.push(file[1]);
+  }
+  return refs;
+}
 
-fs.mkdirSync(path.dirname(DETECTOR_OUTPUT), { recursive: true });
-fs.writeFileSync(DETECTOR_OUTPUT, output);
-console.log(`Generated ${path.relative(ROOT, DETECTOR_OUTPUT)} (${(output.length / 1024).toFixed(1)} KB)`);
+/** Throws unless every path `manifest` and its background reference exists under `dir`. */
+function checkReferences(dir, manifest, label) {
+  const background = manifest.background?.service_worker;
+  const swSource = fs.readFileSync(path.join(EXT_DIR, DETECTOR_WORKER), 'utf-8');
+  const declared = manifestReferences(manifest);
+  const loaded = background && manifest.background?.type === 'module' ? moduleReferences(dir, background) : [];
+  // The detector's worker opens and injects its files by path.
+  const detector = [...declared, ...loaded].includes(DETECTOR_WORKER) ? serviceWorkerReferences(swSource) : [];
+  const referenced = [...new Set([...declared, ...loaded, ...detector])];
+  const missingRefs = referenced.filter((rel) => !fs.existsSync(path.join(dir, rel)));
+  if (missingRefs.length) {
+    throw new Error(
+      `${label} is missing referenced file(s):\n${missingRefs.map((r) => `  · ${r}`).join('\n')}`,
+    );
+  }
+  console.log(`Checked ${referenced.length} referenced paths; all present in ${label}`);
+}
 
-// --- 2. Extract antipatterns.json ---
-
-// Include description so the devtools panel can show the full rule explanation
-// in tooltips.
-const apJson = ANTIPATTERNS.map(({ id, name, category, description }) => ({
-  id,
-  name,
-  category: category || 'quality',
-  description: description || '',
-}));
-fs.writeFileSync(AP_OUTPUT, JSON.stringify(apJson, null, 2) + '\n');
-console.log(`Generated ${path.relative(ROOT, AP_OUTPUT)} (${ANTIPATTERNS.length} rules)`);
+checkReferences(EXT_DIR, chromeManifest, 'extension/');
 
 // --- 3. Zip packaging ---
-
-import { execSync } from 'child_process';
 
 const DIST = path.join(ROOT, 'dist');
 fs.mkdirSync(DIST, { recursive: true });
@@ -103,59 +154,19 @@ function packZip(zipPath, cwd, excludes = []) {
   console.log(`Packaged ${path.relative(ROOT, zipPath)} (${(size / 1024).toFixed(1)} KB)`);
 }
 
-// --- 3a. Chrome zip (manifest unchanged) ---
+// --- 3a. The Chrome store zip ---
 
-packZip(path.join(DIST, 'extension.zip'), EXT_DIR, ['STORE_LISTING.md', '*.DS_Store']);
+const chromeStageDir = path.join(DIST, 'extension-chrome');
+const chromeStoreManifest = stageStore(EXT_DIR, chromeStageDir);
+console.log(`Staged ${path.relative(ROOT, chromeStageDir)}/ (Chrome store manifest)`);
+checkReferences(chromeStageDir, chromeStoreManifest, `${path.relative(ROOT, chromeStageDir)}/`);
+packZip(path.join(DIST, 'extension.zip'), chromeStageDir, ['*.DS_Store']);
 
-// --- 3b. Firefox: derive a Gecko-compatible manifest and stage an unpacked
-// build (consumed by `web-ext lint` in CI), then zip it for AMO. ---
-
-const chromeManifest = JSON.parse(fs.readFileSync(path.join(EXT_DIR, 'manifest.json'), 'utf-8'));
-
-const serviceWorker = chromeManifest.background?.service_worker;
-if (!serviceWorker) {
-  throw new Error(
-    'extension/manifest.json: expected background.service_worker to derive the Firefox manifest',
-  );
-}
-
-const firefoxManifest = {
-  ...chromeManifest,
-  // Gecko supports MV3 via non-persistent event pages. Declaring `scripts`
-  // (rather than `service_worker`) is the path supported across all MV3 Firefox
-  // releases; service-worker.js uses only top-level listeners + an in-memory
-  // Map, so it runs unchanged as an event page.
-  background: { scripts: [serviceWorker] },
-  // Required by AMO for signing/distribution. Ignored by Chrome.
-  browser_specific_settings: {
-    gecko: {
-      id: 'impeccable@bakaus.com',
-      // `data_collection_permissions` (below) is required by AMO for new
-      // submissions and is only honored on Firefox 140+. We set the floor to
-      // 140 so the declared min version actually supports every key we ship;
-      // everything else this extension uses (MV3 action, scripting, devtools,
-      // object-form web_accessible_resources, storage.sync) landed long before.
-      strict_min_version: '140.0',
-      // The detector runs entirely in-page; nothing is transmitted off-device.
-      data_collection_permissions: { required: ['none'] },
-    },
-  },
-};
+// --- 3b. Firefox: stage an unpacked build (consumed by `web-ext lint` in CI),
+// then zip it for AMO. ---
 
 const ffStageDir = path.join(DIST, 'extension-firefox');
-fs.rmSync(ffStageDir, { recursive: true, force: true });
-fs.cpSync(EXT_DIR, ffStageDir, {
-  recursive: true,
-  filter: (src) => {
-    const base = path.basename(src);
-    return base !== 'STORE_LISTING.md' && base !== '.DS_Store';
-  },
-});
-fs.writeFileSync(
-  path.join(ffStageDir, 'manifest.json'),
-  JSON.stringify(firefoxManifest, null, 2) + '\n',
-);
+const firefoxManifest = stageFirefox(EXT_DIR, ffStageDir);
 console.log(`Staged ${path.relative(ROOT, ffStageDir)}/ (Firefox manifest)`);
-
-// STORE_LISTING.md is already filtered out of the stage dir above.
+checkReferences(ffStageDir, firefoxManifest, `${path.relative(ROOT, ffStageDir)}/`);
 packZip(path.join(DIST, 'extension-firefox.zip'), ffStageDir, ['*.DS_Store']);

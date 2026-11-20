@@ -5,6 +5,7 @@ import { pathToFileURL } from 'node:url';
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 export const LABEL_DEFS = [
+  { name: 'needs triage', color: 'd4c5f9', description: 'New or reopened issue awaiting maintainer triage' },
   { name: 'waiting on contributor', color: 'fbca04', description: 'Waiting for the PR author to respond or make changes' },
   { name: 'needs maintainer review', color: '5319e7', description: 'Ready for a maintainer to review or decide' },
   { name: 'ready to merge', color: '0e8a16', description: 'Passing, resolved, and ready for a maintainer merge decision' },
@@ -38,11 +39,24 @@ export const CLOSE_MARKER = '<!-- impeccable-sheriff:auto-close -->';
 const DEFAULT_MAINTAINERS = ['pbakaus'];
 const DEFAULT_REGULAR_CONTRIBUTORS = ['pbakaus', 'abdulwahabone'];
 const DEFAULT_EXEMPT_LABELS = ['do not close', 'security'];
+// Authors whose PRs the sheriff labels but never marks stale, warns or closes, even with
+// --auto-close-regulars. The decider approved their PRs without an issue first.
+const DEFAULT_NEVER_CLOSE_AUTHORS = ['mvanhorn'];
 const DEFAULT_TRUSTED_MARKER_AUTHORS = ['github-actions', 'github-actions[bot]'];
 
 const REVIEW_BLOCKING_STATES = new Set(['CHANGES_REQUESTED']);
 const FAILING_STATUS_STATES = new Set(['ERROR', 'FAILURE']);
+const CONTRIBUTOR_POLICY_LABELS = new Set([
+  'policy: needs issue',
+  'policy: needs ai disclosure',
+  'policy: generated output',
+]);
+const MAINTAINER_DECISION_LABEL = 'policy: needs maintainer decision';
 const SHERIFF_WAIT_COMMAND = /^\/sheriff\s+wait\s*$/i;
+
+function normalizeLabelName(label) {
+  return String(label || '').trim().toLowerCase();
+}
 
 const PR_QUERY = `
 query($owner: String!, $name: String!, $after: String) {
@@ -139,11 +153,15 @@ export function evaluatePullRequest(pr, options = {}) {
   const closeDays = Number.isFinite(options.closeDays) ? options.closeDays : 14;
   const maintainers = loginSet(options.maintainers || DEFAULT_MAINTAINERS);
   const regularContributors = loginSet(options.regularContributors || DEFAULT_REGULAR_CONTRIBUTORS);
-  const exemptLabels = new Set(options.exemptLabels || DEFAULT_EXEMPT_LABELS);
+  const exemptLabels = new Set(
+    (options.exemptLabels || DEFAULT_EXEMPT_LABELS).map(normalizeLabelName),
+  );
   const trustedMarkerAuthors = loginSet(options.trustedMarkerAuthors || DEFAULT_TRUSTED_MARKER_AUTHORS);
   const autoCloseRegulars = options.autoCloseRegulars === true;
+  const neverCloseAuthors = loginSet(options.neverCloseAuthors || DEFAULT_NEVER_CLOSE_AUTHORS);
 
   const labels = new Set(pr.labels || []);
+  const policyBlockers = [...labels].filter(isBlockingPolicyLabel);
   const author = normalizeLogin(pr.authorLogin || pr.author?.login || '');
   const daysOpen = Math.floor((now.getTime() - toDate(pr.createdAt).getTime()) / DAY_MS);
   const latestContributorCommitAt = latestCommitBelongsToAuthor(pr, author) ? pr.latestCommitAt : null;
@@ -173,7 +191,30 @@ export function evaluatePullRequest(pr, options = {}) {
   }
 
   if (pr.mergeable === 'CONFLICTING') {
-    addBlocker({ kind: 'merge-conflicts', label: 'blocked: merge conflicts', at: pr.updatedAt });
+    const firstSeenAt = latestLabelEventAt(
+      pr.labelEvents || [],
+      'blocked: merge conflicts',
+      'LabeledEvent',
+    ) || pr.updatedAt || pr.latestCommitAt || pr.createdAt;
+    addContributorBlocker({
+      kind: 'merge-conflicts',
+      label: 'blocked: merge conflicts',
+      at: latestDate([firstSeenAt, latestContributorAt]),
+    });
+  }
+
+  for (const label of policyBlockers) {
+    const firstSeenAt = latestLabelEventAt(
+      pr.labelEvents || [],
+      label,
+      'LabeledEvent',
+    ) || pr.updatedAt || pr.createdAt;
+    const blocker = {
+      kind: label,
+      at: latestDate([firstSeenAt, latestContributorAt]),
+    };
+    if (CONTRIBUTOR_POLICY_LABELS.has(label)) addContributorBlocker(blocker);
+    else addBlocker(blocker);
   }
 
   if (latestBlockingReviewAt && !isAfter(latestContributorAt, latestBlockingReviewAt)) {
@@ -202,10 +243,20 @@ export function evaluatePullRequest(pr, options = {}) {
     addContributorBlocker({ kind: 'manual-waiting', at: waitingLabelAt });
   }
 
-  const contributorActionBlockerAt = latestDate(blockers
-    .filter((blocker) => blocker.contributorAction)
-    .map((blocker) => blocker.at || pr.createdAt));
-  const contributorActionRequired = blockers.some((blocker) => blocker.contributorAction);
+  // An explicit maintainer decision owns the next step even if the PR is a
+  // draft or still has contributor-resolvable blockers. Keep those blockers
+  // visible, but do not warn or close while the contributor awaits a decision.
+  const needsMaintainerDecision = labels.has(MAINTAINER_DECISION_LABEL);
+  const contributorActionRequired = !needsMaintainerDecision
+    && blockers.some((blocker) => blocker.contributorAction);
+  // Returning responsibility starts a fresh window; an old draft timestamp or
+  // warning must not count time that was spent waiting on maintainers.
+  const contributorActionBlockerAt = contributorActionRequired ? latestDate([
+    ...blockers
+      .filter((blocker) => blocker.contributorAction)
+      .map((blocker) => blocker.at || pr.createdAt),
+    latestLabelEventAt(pr.labelEvents || [], MAINTAINER_DECISION_LABEL, 'UnlabeledEvent'),
+  ]) : null;
   const waitingDays = contributorActionRequired && contributorActionBlockerAt
     ? Math.floor((now.getTime() - contributorActionBlockerAt.getTime()) / DAY_MS)
     : 0;
@@ -216,6 +267,7 @@ export function evaluatePullRequest(pr, options = {}) {
     && !contributorActionRequired
     && unresolvedThreadCount === 0
     && pr.reviewDecision !== 'CHANGES_REQUESTED'
+    && policyBlockers.length === 0
     && statusIsReady
     && mergeableIsReady;
 
@@ -228,14 +280,16 @@ export function evaluatePullRequest(pr, options = {}) {
     if (blocker.label) desiredLabels.add(blocker.label);
   }
 
-  const staleEligible = contributorActionRequired && waitingDays >= warningDays;
+  const neverCloseAuthor = neverCloseAuthors.has(author);
+  const staleEligible = contributorActionRequired && waitingDays >= warningDays && !neverCloseAuthor;
   if (staleEligible) desiredLabels.add('stale');
 
   const warningPostedAt = latestMarkerAt(pr.comments, WARNING_MARKER, trustedMarkerAuthors);
   const warningAlreadyPosted = Boolean(warningPostedAt
     && (!contributorActionBlockerAt || !isAfter(contributorActionBlockerAt, warningPostedAt)));
   const closeAlreadyPosted = hasMarker(pr.comments, CLOSE_MARKER, trustedMarkerAuthors);
-  const exemptFromClose = [...labels].some((label) => exemptLabels.has(label));
+  const exemptFromClose = [...labels]
+    .some((label) => exemptLabels.has(normalizeLabelName(label)));
   const regularContributor = regularContributors.has(author);
   const shouldWarn = staleEligible && !warningAlreadyPosted;
   const shouldClose = contributorActionRequired
@@ -243,6 +297,7 @@ export function evaluatePullRequest(pr, options = {}) {
     && warningAlreadyPosted
     && !closeAlreadyPosted
     && !exemptFromClose
+    && !neverCloseAuthor
     && (autoCloseRegulars || !regularContributor);
 
   const labelsToAdd = [...desiredLabels].filter((label) => !labels.has(label)).sort();
@@ -373,7 +428,7 @@ export function staleWarningComment(pr, {
     WARNING_MARKER,
     `Thanks for the PR. Impeccable is moving quickly, and this PR is currently waiting on contributor action.`,
     '',
-    `It has been waiting for contributor action for ${waitingDays} days. Please address the outstanding review feedback, draft state, or explicit maintainer wait request. PRs that are still waiting on contributor action after ${closeDays} days are closed automatically.`,
+    `It has been waiting for contributor action for ${waitingDays} days. Please address the outstanding review feedback, draft state, merge conflict, policy requirement, or explicit maintainer wait request. PRs that are still waiting on contributor action after ${closeDays} days are closed automatically.`,
     '',
     `If nothing changes, this PR may be closed on or after ${closeDate}. Happy to reopen when it is ready to continue.`,
   ].join('\n');
@@ -401,7 +456,7 @@ export async function main(argv = process.argv.slice(2)) {
 
   const prs = fetchOpenPullRequests(repo).map(normalizePullRequest);
   hydrateIssueComments(repo, prs);
-  hydrateMissingWaitingLabelEvents(repo, prs);
+  hydrateIssueLabelEvents(repo, prs);
   const plans = prs.map((pr) => evaluatePullRequest(pr, options));
 
   for (const plan of plans) {
@@ -422,6 +477,7 @@ export function parseArgs(argv) {
     regularContributors: DEFAULT_REGULAR_CONTRIBUTORS,
     exemptLabels: DEFAULT_EXEMPT_LABELS,
     autoCloseRegulars: false,
+    neverCloseAuthors: DEFAULT_NEVER_CLOSE_AUTHORS,
     now: new Date(),
   };
 
@@ -436,6 +492,7 @@ export function parseArgs(argv) {
     else if (arg === '--close-days') options.closeDays = Number(requireValue(argv, ++i, arg));
     else if (arg === '--maintainers') options.maintainers = splitList(requireValue(argv, ++i, arg));
     else if (arg === '--regular-contributors') options.regularContributors = splitList(requireValue(argv, ++i, arg));
+    else if (arg === '--never-close-authors') options.neverCloseAuthors = splitList(requireValue(argv, ++i, arg));
     else if (arg === '--exempt-labels') options.exemptLabels = splitList(requireValue(argv, ++i, arg));
     else if (arg === '--now') options.now = new Date(requireValue(argv, ++i, arg));
     else if (arg === '--help' || arg === '-h') {
@@ -508,10 +565,11 @@ function applyPlan(repo, plan, options) {
   }
 }
 
-function hydrateMissingWaitingLabelEvents(repo, prs) {
+function hydrateIssueLabelEvents(repo, prs) {
   for (const pr of prs) {
-    if (!(pr.labels || []).includes('waiting on contributor')) continue;
-    if (latestLabelEventAt(pr.labelEvents || [], 'waiting on contributor', 'LabeledEvent')) continue;
+    // The last 100 GraphQL label events can omit a maintainer-decision
+    // handoff, even when no waiting label is present. Read every page so an
+    // old warning cannot authorize closure after a recent handoff.
     mergeIssueLabelEvents(pr, fetchIssueEvents(repo, pr.number));
   }
 }
@@ -533,13 +591,23 @@ function fetchIssueComments(repo, number) {
 }
 
 function fetchIssueEvents(repo, number) {
-  const pages = runGhJson([
-    'api',
-    '--paginate',
-    '--slurp',
-    `repos/${repo}/issues/${number}/events?per_page=100`,
-  ]);
-  return Array.isArray(pages) ? pages.flat() : [];
+  const events = [];
+  for (let page = 1; ; page += 1) {
+    // Bound subprocess output by one page of small label-event records, not
+    // the size of the entire history (or unrelated event payloads). Count the
+    // raw page so a page without label events does not end pagination early.
+    const result = runGhJson([
+      'api',
+      `repos/${repo}/issues/${number}/events?per_page=100&page=${page}`,
+      '--jq',
+      '{count: length, events: [.[] | select(.event == "labeled" or .event == "unlabeled") | {event, created_at, label: {name: .label.name}, actor: {login: .actor.login}}]}',
+    ]);
+    if (!Number.isInteger(result.count) || result.count < 0 || result.count > 100 || !Array.isArray(result.events)) {
+      throw new Error(`Invalid issue event page for PR #${number}`);
+    }
+    events.push(...result.events);
+    if (result.count < 100) return events;
+  }
 }
 
 function fetchOpenPullRequests(repo) {
@@ -760,6 +828,10 @@ function normalizeLogin(login) {
   return String(login || '').toLowerCase();
 }
 
+function isBlockingPolicyLabel(label) {
+  return String(label || '').startsWith('policy:') && label !== 'policy: approved';
+}
+
 function requireValue(argv, index, flag) {
   const value = argv[index];
   if (!value || value.startsWith('--')) throw new Error(`${flag} requires a value.`);
@@ -804,6 +876,8 @@ Options:
   --maintainers a,b               maintainer logins allowed to use /sheriff wait
   --regular-contributors a,b      contributors exempt from auto-close unless --auto-close-regulars is set
   --auto-close-regulars           also auto-close regular contributor PRs
+  --never-close-authors a,b       authors never warned or auto-closed, even with --auto-close-regulars
+                                  (default: mvanhorn)
   --no-label-ensure               skip creating/updating sheriff labels
 `);
 }

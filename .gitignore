@@ -13,9 +13,16 @@ build/
 # can copy them into tmp git repos and assert is-generated behavior.
 !tests/framework-fixtures/**/dist/
 !tests/framework-fixtures/**/dist/**
+# Same for the oracle workspaces: live-html carries a dist/generated.html
+# that the generated-file cases point at.
+!tests/oracle/workspaces/**/dist/
+!tests/oracle/workspaces/**/dist/**
 
 # Build artifacts
 *.log
+
+# Cargo (the Rust workspace; Cargo.lock IS tracked, it pins the engine build)
+/target/
 
 # OS files
 .DS_Store
@@ -67,7 +74,7 @@ src/__impeccable_provider_smoke_*.html
 # Per-run critique snapshots are local artifacts. ignore.md (also under
 # this dir) carries deferrals the user may want to share, so it's
 # explicitly re-included below.
-.impeccable/critique/
+.impeccable/critique/*
 !.impeccable/critique/ignore.md
 
 # Legacy live mode session file + annotation screenshots
@@ -82,6 +89,13 @@ src/lib/impeccable/__runtime.js
 
 # Extension build artifacts
 extension/detector/
+# A browser test's walk address for the unpacked build (extension/walks/link.js)
+extension/outing.json
+
+# Engine binaries: fetched per platform (scripts/fetch-engine.mjs), never tracked.
+# The launcher next to them (skill/scripts/impeccable) is the tracked file.
+skill/scripts/bin/
+**/skills/impeccable/scripts/bin/
 
 # Legacy design context (pre-v3.1, auto-migrated to PRODUCT.md by load-context.mjs)
 .impeccable.md

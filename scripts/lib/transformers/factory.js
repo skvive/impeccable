@@ -1,3 +1,4 @@
+import fs from 'fs';
 import path from 'path';
 import {
   cleanDir,
@@ -17,7 +18,7 @@ import { hooksJsonFor } from './hooks.js';
 // These files are single-sourced from skill/agents/ so a harness with no
 // subagent capability runs each role inline from the same specialized text.
 const DEGRADED_PREAMBLE = `<!-- Generated from skill/agents/ at build time. Do not edit; edit the agent definition. -->
-This harness has no subagent capability, so you are running this role inline. Step fully out of the work you just finished, adopt only this file's instructions for the pass, and disclose the substitution in one line when you report. Where the text below addresses a parent agent, you are both parties: produce the full output contract first, then act on it yourself.`;
+This harness has no subagent capability, so you are running this role inline. Step fully out of the work you just finished, adopt only this file's instructions for the pass, and disclose the substitution in one line of your closing message to the user, outside the output contract. Where the text below addresses a parent agent, you are both parties: produce the full output contract first, then act on it yourself.`;
 
 /**
  * Map from frontmatter field name to extraction spec.
@@ -122,18 +123,85 @@ function buildCodexAgent(agent, body) {
   return `${lines.join('\n')}\n`;
 }
 
-function buildClaudeAgent(agent, body) {
+// Leaving `tools` out grants every tool, MCP servers included; an allowlist
+// shuts MCP out (#1328). Only Claude Code documents a `disallowedTools`
+// denylist. Grok reads the same format but documents none, so there a role
+// inherits everything rather than trusting a key Grok may ignore.
+function buildClaudeAgent(agent, body, config = {}) {
   const frontmatter = {
     name: agent.claudeName || agent.name,
     description: agent.description,
   };
 
   if (agent.tools) frontmatter.tools = agent.tools;
+  if (agent.disallowedTools && config.provider === 'claude-code') frontmatter.disallowedTools = agent.disallowedTools;
   if (agent.model) frontmatter.model = agent.model;
   if (agent.effort) frontmatter.effort = agent.effort;
   if (agent.maxTurns) frontmatter.maxTurns = agent.maxTurns;
 
   return `${generateYamlFrontmatter(frontmatter)}\n${body.trim()}\n`;
+}
+
+// GitHub Copilot custom agents are markdown files named `<name>.agent.md`
+// (project scope: `.github/agents/`; user scope: `~/.copilot/agents/`). Only
+// the portable frontmatter fields are emitted: `name` and `description`.
+// `tools` is omitted deliberately -- omitting it grants access to all tools,
+// and Copilot's tool vocabulary differs from ours -- and Copilot has no
+// documented model/effort/max-turns equivalents. VS Code-specific fields
+// (handoffs, argument-hint) are ignored elsewhere, so none are emitted.
+function buildCopilotAgent(agent, body) {
+  const frontmatter = {
+    name: agent.name,
+    description: agent.description,
+  };
+
+  return `${generateYamlFrontmatter(frontmatter)}\n${body.trim()}\n`;
+}
+
+// Cursor subagents are plain markdown files with YAML frontmatter (project
+// scope: `.cursor/agents/`; user scope: `~/.cursor/agents/`). Fields: name,
+// description (drives auto-delegation), model (`inherit` maps directly to our
+// value), readonly, is_background. `readonly` is derived from the agent's own
+// tool lists: a role that denies Write and Edit, or declares tools without
+// them, is a reader, and Cursor can enforce that. effort/max-turns are skipped: Cursor's
+// effort option requires an explicit model id, incompatible with `inherit`.
+function buildCursorAgent(agent, body) {
+  const frontmatter = {
+    name: agent.name,
+    description: agent.description,
+    model: agent.model || 'inherit',
+  };
+
+  const list = (value) => String(value || '').split(',').map(t => t.trim()).filter(Boolean);
+  const tools = list(agent.tools);
+  const denied = list(agent.disallowedTools);
+  const deniesWrites = denied.includes('Write') && denied.includes('Edit');
+  if (deniesWrites || (tools.length > 0 && !tools.includes('Write') && !tools.includes('Edit'))) {
+    frontmatter.readonly = true;
+  }
+  // The parent thread waits on each role's return; none of these run detached.
+  frontmatter.is_background = false;
+
+  return `${generateYamlFrontmatter(frontmatter)}\n${body.trim()}\n`;
+}
+
+/**
+ * Render an agent's markdown body for one provider.
+ *
+ * Every surface that ships an agent body (the degraded fallback reference, the
+ * Codex .toml nested inside the skill, and the native agent file) goes through
+ * here, so all three resolve provider blocks, {{placeholders}}, rule markers,
+ * and {{scripts_path}} the same way. The nested Codex .toml used to skip the
+ * last two and shipped `node {{scripts_path}}/embed-prompt.mjs` literally.
+ * {{reference_path}} is the skill's reference/ dir relative to emitDir: a
+ * markdown link resolves against its own file, and each surface lands elsewhere.
+ */
+function renderAgentBody(agent, { providerTags, placeholderKey, allSkillNames, scriptsPath, emitDir, skillDir }) {
+  let body = compileProviderBlocks(agent.body, providerTags);
+  body = replacePlaceholders(body, placeholderKey, [], allSkillNames);
+  body = stripRuleMarkers(body);
+  body = body.replace(/\{\{reference_path\}\}/g, path.relative(emitDir, path.join(skillDir, 'reference')).split(path.sep).join('/'));
+  return body.replace(/\{\{scripts_path\}\}/g, scriptsPath);
 }
 
 function buildAgentFile(config, agent, body) {
@@ -147,7 +215,21 @@ function buildAgentFile(config, agent, body) {
   if (config.agentFormat === 'claude-md') {
     return {
       filename: `${agent.claudeName || agent.name}.md`,
-      content: buildClaudeAgent(agent, body),
+      content: buildClaudeAgent(agent, body, config),
+    };
+  }
+
+  if (config.agentFormat === 'copilot-agent-md') {
+    return {
+      filename: `${agent.name}.agent.md`,
+      content: buildCopilotAgent(agent, body),
+    };
+  }
+
+  if (config.agentFormat === 'cursor-md') {
+    return {
+      filename: `${agent.name}.md`,
+      content: buildCursorAgent(agent, body),
     };
   }
 
@@ -168,9 +250,11 @@ export function createTransformer(config) {
     frontmatterFields = [],
     bodyTransform,
     placeholderProvider,
+    descriptionKey,
     providerTags = [provider],
     writeOpenAIMetadata = false,
     includeVersion = true,
+    versionInMetadata = false,
   } = config;
   const placeholderKey = placeholderProvider || provider;
 
@@ -202,14 +286,23 @@ export function createTransformer(config) {
       // Build frontmatter
       const frontmatterObj = {
         name: skillName,
-        description: skill.description,
+        description: (descriptionKey && skill[descriptionKey]) || skill.description,
       };
-      if (skillsVersion && includeVersion) frontmatterObj.version = skillsVersion;
+      if (skillsVersion && includeVersion && !versionInMetadata) {
+        frontmatterObj.version = skillsVersion;
+      }
 
       for (const spec of activeFields) {
         if (spec.condition && !spec.condition(skill)) continue;
         const val = spec.value ? spec.value(skill) : skill[spec.sourceKey];
         if (val) frontmatterObj[spec.yamlKey] = val;
+      }
+
+      if (skillsVersion && includeVersion && versionInMetadata) {
+        frontmatterObj.metadata = {
+          ...(frontmatterObj.metadata || {}),
+          version: skillsVersion,
+        };
       }
 
       // Replace {{command_hint}} in argument-hint with command names from metadata,
@@ -276,10 +369,7 @@ export function createTransformer(config) {
         ensureDir(degradedDir);
         for (const agent of skill.agents) {
           const role = agent.name.replace(/^impeccable-/, '');
-          let body = compileProviderBlocks(agent.body, providerTags);
-          body = replacePlaceholders(body, placeholderKey, [], allSkillNames);
-          body = stripRuleMarkers(body);
-          body = body.replace(/\{\{scripts_path\}\}/g, scriptsPath);
+          const body = renderAgentBody(agent, { providerTags, placeholderKey, allSkillNames, scriptsPath, emitDir: degradedDir, skillDir });
           const content = `${DEGRADED_PREAMBLE}\n\n${body.replace(/^\s+/, '')}`;
           writeFile(path.join(degradedDir, `${role}.md`), content);
           refCount++;
@@ -292,7 +382,12 @@ export function createTransformer(config) {
         ensureDir(scriptsOutDir);
         for (const script of skill.scripts) {
           const scriptContent = replaceScriptProviderMarker(script.content, placeholderKey, provider);
-          writeFile(path.join(scriptsOutDir, script.name), scriptContent);
+          const outPath = path.join(scriptsOutDir, script.name);
+          writeFile(outPath, scriptContent);
+          // The launcher must stay executable in every provider copy; a
+          // plain write would drop the bit and `impeccable context` would
+          // fail with EACCES on the first session.
+          if (script.mode) fs.chmodSync(outPath, script.mode);
           scriptCount++;
         }
       }
@@ -304,8 +399,7 @@ export function createTransformer(config) {
       if (CODEX_SKILL_PROVIDERS.has(provider)) {
         for (const agent of skill.agents || []) {
           if (agent.providers && !agent.providers.includes('codex')) continue;
-          let agentBody = compileProviderBlocks(agent.body, providerTags);
-          agentBody = replacePlaceholders(agentBody, placeholderKey, [], allSkillNames);
+          const agentBody = renderAgentBody(agent, { providerTags, placeholderKey, allSkillNames, scriptsPath, emitDir: path.join(skillDir, 'agents'), skillDir });
           const filename = `${agent.codexName || agent.name.replace(/-/g, '_')}.toml`;
           ensureDir(path.join(skillDir, 'agents'));
           writeFile(path.join(skillDir, 'agents', filename), buildCodexAgent(agent, agentBody));
@@ -313,15 +407,37 @@ export function createTransformer(config) {
       }
     }
 
+    // Ship an explicit slash-command surface for OpenCode. OpenCode registers
+    // skill commands natively but its TUI autocomplete hides them by deliberate
+    // design (anomalyco/opencode#25439); this file also pins execution policy
+    // (agent: build, subtask: true) and routes through OpenCode's skill tool,
+    // which resolves the skill base dir for any install scope. Menu visibility
+    // is the only part contingent on OpenCode's design; the rest is intentional.
+    // Schema restricted to what OpenCode recognises (description, agent, model,
+    // variant, subtask).
+    if (provider === 'opencode' && skills.length > 0) {
+      const commandsDir = path.join(providerDir, `${configDir}/commands`);
+      ensureDir(commandsDir);
+      for (const skill of skills) {
+        const bridgeBody = `Call skill({ name: "${skill.name}" }) and follow its \`Setup\` and \`Commands\` sections to handle $ARGUMENTS.\n`;
+        const bridgeFrontmatter = generateYamlFrontmatter({
+          description: skill.description,
+          agent: 'build',
+          subtask: true,
+        });
+        writeFile(path.join(commandsDir, `${skill.name}.md`), `${bridgeFrontmatter}\n${bridgeBody}`.replace(/\n+$/, '\n'));
+      }
+    }
+
     if (config.agentFormat) {
       const agentsDir = path.join(providerDir, `${configDir}/agents`);
       for (const skill of skills) {
+        const scriptsPath = `${configDir}/skills/${skill.name}/scripts`;
         for (const agent of skill.agents || []) {
           // Agents can declare `providers: <list>` to limit which harnesses
           // they emit to. Default (no field) ships everywhere with agentFormat.
           if (agent.providers && !agent.providers.includes(provider)) continue;
-          let body = compileProviderBlocks(agent.body, providerTags);
-          body = replacePlaceholders(body, placeholderKey, [], allSkillNames);
+          const body = renderAgentBody(agent, { providerTags, placeholderKey, allSkillNames, scriptsPath, emitDir: agentsDir, skillDir: path.join(skillsDir, skill.name) });
           const agentFile = buildAgentFile(config, agent, body);
           if (!agentFile) continue;
           ensureDir(agentsDir);
@@ -339,9 +455,22 @@ export function createTransformer(config) {
       const manifest = hooksJsonFor(config.emitHooks, { configDir });
       if (manifest) {
         const hooksRel = config.hooksManifestRel || path.join('hooks', 'hooks.json');
-        writeFile(path.join(providerDir, configDir, hooksRel), JSON.stringify(manifest, null, 2) + '\n');
+        writeFile(path.join(providerDir, config.hooksManifestDir || configDir, hooksRel), JSON.stringify(manifest, null, 2) + '\n');
         hooksEmitted = true;
       }
+    }
+
+    // Emit a provider plugin verbatim from the skill's payloads (Hermes:
+    // skill/hermes-plugin/ -> .hermes/plugins/impeccable-design-hook/). A
+    // skill without the payload emits none; tests/hook-build.test.mjs pins
+    // that the real source carries it.
+    let pluginInfo = '';
+    const payloadFiles = config.pluginPayload ? skills.flatMap(skill => skill.payloads?.[config.pluginPayload.source] ?? []) : [];
+    if (payloadFiles.length > 0) {
+      for (const file of payloadFiles) {
+        writeFile(path.join(providerDir, configDir, config.pluginPayload.dest, file.name), file.content);
+      }
+      pluginInfo = ` (${config.pluginPayload.dest})`;
     }
 
     const skillWord = skills.length === 1 ? 'skill' : 'skills';
@@ -351,6 +480,6 @@ export function createTransformer(config) {
     const hooksInfo = hooksEmitted
       ? ` (${config.hooksManifestRel || path.join('hooks', 'hooks.json')})`
       : '';
-    console.log(`✓ ${displayName}: ${skills.length} ${skillWord}${refInfo}${scriptInfo}${agentInfo}${hooksInfo}`);
+    console.log(`✓ ${displayName}: ${skills.length} ${skillWord}${refInfo}${scriptInfo}${agentInfo}${hooksInfo}${pluginInfo}`);
   };
 }

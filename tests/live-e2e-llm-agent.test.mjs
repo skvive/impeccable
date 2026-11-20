@@ -7,6 +7,7 @@ import {
   MANUAL_EDIT_SYSTEM_INSTRUCTIONS,
   VARIANT_SYSTEM_INSTRUCTIONS,
   createLlmAgent,
+  llmRequestSettings,
   parseManualEditResponse,
   parseVariantResponse,
   progressiveVariantGuidance,
@@ -19,15 +20,37 @@ import {
   validateVariantVisibleCopy,
 } from './live-e2e/agents/llm-agent.mjs';
 
+describe('live-e2e LLM request settings', () => {
+  it('explicitly selects low-effort DeepSeek thinking for bounded JSON edit requests', () => {
+    assert.deepEqual(llmRequestSettings('deepseek'), {
+      thinking: { type: 'enabled' }, output_config: { effort: 'low' },
+    });
+  });
+
+  it('leaves other providers unchanged', () => {
+    assert.deepEqual(llmRequestSettings('anthropic'), {});
+    assert.deepEqual(llmRequestSettings('openai'), {});
+  });
+});
+
 describe('live-e2e LLM agent provider config', () => {
-  it('defaults to Anthropic and Claude Haiku when no keys are present', () => {
+  it('defaults to OpenAI gpt-5.6-terra at medium reasoning effort', () => {
     const config = resolveLlmAgentConfig({}, {});
+
+    assert.equal(config.provider, 'openai');
+    assert.equal(config.model, 'gpt-5.6-terra');
+    assert.equal(config.reasoningEffort, 'medium');
+    assert.equal(config.requiredEnv, 'OPENAI_API_KEY');
+    assert.equal(config.apiKey, undefined);
+    assert.equal(config.baseURL, undefined);
+  });
+
+  it('still resolves Anthropic when explicitly selected', () => {
+    const config = resolveLlmAgentConfig({}, { IMPECCABLE_E2E_LLM_PROVIDER: 'anthropic', ANTHROPIC_API_KEY: 'k' });
 
     assert.equal(config.provider, 'anthropic');
     assert.equal(config.model, 'claude-haiku-4-5');
     assert.equal(config.requiredEnv, 'ANTHROPIC_API_KEY');
-    assert.equal(config.apiKey, undefined);
-    assert.equal(config.baseURL, undefined);
   });
 
   it('prefers Anthropic when both provider keys are present', () => {
@@ -102,6 +125,42 @@ describe('live-e2e LLM agent provider config', () => {
 });
 
 describe('live-e2e LLM agent createLlmAgent', () => {
+  for (const provider of ['anthropic', 'deepseek']) {
+    it(`serializes supported sampling parameters for ${provider} edit requests`, async (t) => {
+      const requests = [];
+      t.mock.method(globalThis, 'fetch', async (_url, options) => {
+        requests.push(JSON.parse(options.body));
+        return new Response(JSON.stringify({
+          type: 'error', error: { type: 'invalid_request_error', message: 'request captured' },
+        }), { status: 400, headers: { 'content-type': 'application/json' } });
+      });
+      const agent = await createLlmAgent({
+        config: { provider, model: 'test-model', apiKey: 'test-key' },
+        includeLiveSpec: false,
+      });
+      const tmp = createSourceKeyReplayProject('apply');
+      try {
+        for (const invoke of [
+          () => agent.generateVariants({ element: { tag: 'h1', outerHtml: '<h1>Title</h1>' } }),
+          () => agent.applyManualEdits({ id: 'sampling-test', batch: sourceKeyReplayBatch('apply') }, { tmp }),
+        ]) {
+          requests.length = 0;
+          await assert.rejects(invoke, /request captured/);
+          assert.ok(requests.length > 0);
+          for (const request of requests) {
+            if (provider === 'anthropic') {
+              assert.equal(Object.hasOwn(request, 'temperature'), false);
+            } else {
+              assert.equal(request.temperature, 0);
+            }
+          }
+        }
+      } finally {
+        rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+  }
+
   it('uses an explicit opts.config without re-reading env', async () => {
     const agent = await createLlmAgent({
       config: {
@@ -1496,6 +1555,12 @@ describe('live-e2e LLM agent variant prompt', () => {
     assert.match(VARIANT_SYSTEM_INSTRUCTIONS, /Do not return source-identical variants/);
     assert.match(VARIANT_SYSTEM_INSTRUCTIONS, /bare text element/);
     assert.match(VARIANT_SYSTEM_INSTRUCTIONS, /Accept persists a real source change/);
+  });
+
+  it('uses permanent styling hooks outside the reserved live-runtime namespace', () => {
+    assert.match(VARIANT_SYSTEM_INSTRUCTIONS, /data-design-variant/);
+    assert.doesNotMatch(VARIANT_SYSTEM_INSTRUCTIONS, /add[^\n]*data-impeccable-e2e-variant/);
+    assert.match(VARIANT_SYSTEM_INSTRUCTIONS, /Never invent data-impeccable-\*/);
   });
 });
 

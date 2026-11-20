@@ -109,15 +109,18 @@ function initSpotlightBlurToggle(currentValue) {
   });
 }
 
+const { CATEGORY_LABELS, presentationCategory, fixSkillFor } = ImpeccableReport;
+
 function renderSettings() {
   settingsList.innerHTML = '';
 
   const categories = {
     slop: { label: 'AI tells', items: [] },
     quality: { label: 'Quality', items: [] },
+    advisory: { label: 'Advisories', items: [] },
   };
   for (const ap of allAntipatterns) {
-    const cat = ap.category || 'quality';
+    const cat = presentationCategory(ap);
     (categories[cat] || categories.quality).items.push(ap);
   }
 
@@ -221,59 +224,6 @@ function showScanning() {
     </div>`;
 }
 
-// Maps each anti-pattern to the most relevant Impeccable skill(s) for fixing it.
-// These are suggestions; the user decides whether and how to apply them.
-const FIX_SKILLS = {
-  // AI slop
-  'side-tab':                'distill, polish',
-  'border-accent-on-rounded':'distill, polish',
-  'overused-font':           'typeset',
-  'single-font':             'typeset',
-  'flat-type-hierarchy':     'typeset',
-  'gradient-text':           'typeset, distill',
-  'ai-color-palette':        'colorize, distill',
-  'nested-cards':            'distill, arrange',
-  'monotonous-spacing':      'arrange',
-  'everything-centered':     'arrange',
-  'bounce-easing':           'animate',
-  'dark-glow':               'quieter, distill',
-  'icon-tile-stacked-above-heading': 'distill, arrange',
-  // Quality
-  'pure-black-white':        'colorize',
-  'gray-on-color':           'colorize',
-  'low-contrast':            'colorize, audit',
-  'layout-transition':       'animate, optimize',
-  'line-length':             'arrange, typeset',
-  'cramped-padding':         'arrange, polish',
-  'tight-leading':           'typeset',
-  'skipped-heading':         'audit, harden',
-  'justified-text':          'typeset',
-  'tiny-text':               'typeset',
-  'all-caps-body':           'typeset',
-  'wide-tracking':           'typeset',
-};
-
-function fixSkillFor(type) {
-  const skills = FIX_SKILLS[type] || 'polish';
-  // Prefix each comma-separated skill with a slash for clarity
-  return skills.split(',').map(s => '/' + s.trim()).join(', ');
-}
-
-// Returns a sorted array of unique skills referenced by the given findings,
-// most-frequent first. Each entry already has the leading slash.
-function uniqueSkillsForFindings(findings) {
-  const counts = new Map();
-  for (const item of findings) {
-    for (const f of item.findings) {
-      const list = (FIX_SKILLS[f.type] || 'polish').split(',').map(s => '/' + s.trim());
-      for (const s of list) {
-        counts.set(s, (counts.get(s) || 0) + 1);
-      }
-    }
-  }
-  return [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([s]) => s);
-}
-
 function getInspectedUrl() {
   return new Promise((resolve) => {
     // Strip the URL fragment — anchors are noise for "what page is this from"
@@ -285,62 +235,11 @@ function getInspectedUrl() {
 }
 
 async function formatFindingsForCopy(findings) {
-  if (!findings.length) return 'Impeccable found no anti-patterns on this page.';
-  const url = await getInspectedUrl();
-  const lines = ['# Impeccable findings'];
-  if (url) lines.push(`URL: ${url}`);
-  lines.push('');
-
-  const groups = { slop: [], quality: [] };
-  for (const item of findings) {
-    for (const f of item.findings) {
-      const cat = f.category || 'quality';
-      groups[cat].push({ ...f, selector: item.selector, isPageLevel: item.isPageLevel });
-    }
-  }
-
-  if (groups.slop.length) {
-    lines.push(`## AI tells (${groups.slop.length})`);
-    for (const f of groups.slop) {
-      const where = f.isPageLevel ? '_(page-level)_' : `\`${f.selector}\``;
-      lines.push(`- **${f.name}** at ${where}: ${f.detail}`);
-    }
-    lines.push('');
-  }
-
-  if (groups.quality.length) {
-    lines.push(`## Quality issues (${groups.quality.length})`);
-    for (const f of groups.quality) {
-      const where = f.isPageLevel ? '_(page-level)_' : `\`${f.selector}\``;
-      lines.push(`- **${f.name}** at ${where}: ${f.detail}`);
-    }
-    lines.push('');
-  }
-
-  // Roll up suggested skills across all findings (most-relevant first)
-  const skills = uniqueSkillsForFindings(findings);
-  if (skills.length) {
-    lines.push(`Suggested Impeccable skills to fix: ${skills.join(', ')}`);
-    lines.push('');
-  }
-
-  lines.push('---');
-  lines.push('Detected by [Impeccable](https://impeccable.style). Skills are suggestions, not required.');
-  return lines.join('\n');
+  return ImpeccableReport.formatFindingsForCopy(findings, await getInspectedUrl());
 }
 
 async function formatSingleFindingForCopy(item, finding) {
-  const url = await getInspectedUrl();
-  const where = item.isPageLevel ? '_(page-level)_' : `\`${item.selector}\``;
-  const lines = [`# Impeccable: ${finding.name}`];
-  if (url) lines.push(`URL: ${url}`);
-  lines.push(`Element: ${where}`);
-  lines.push(`Detail: ${finding.detail}`);
-  lines.push('');
-  lines.push(finding.description);
-  lines.push('');
-  lines.push(`Suggested Impeccable skill(s) to fix: ${fixSkillFor(finding.type)}`);
-  return lines.join('\n');
+  return ImpeccableReport.formatSingleFindingForCopy(item, finding, await getInspectedUrl());
 }
 
 async function copyToClipboard(text, btn) {
@@ -408,10 +307,10 @@ function renderFindings(findings) {
   badge.classList.add('visible');
 
   // Group findings by category, then by anti-pattern type
-  const categories = { slop: new Map(), quality: new Map() };
+  const categories = { slop: new Map(), quality: new Map(), advisory: new Map() };
   for (const item of findings) {
     for (const f of item.findings) {
-      const cat = f.category || 'quality';
+      const cat = presentationCategory(f);
       const groups = categories[cat] || categories.quality;
       if (!groups.has(f.type)) {
         groups.set(f.type, { name: f.name, description: f.description, items: [] });
@@ -422,13 +321,13 @@ function renderFindings(findings) {
         isPageLevel: item.isPageLevel,
         isHidden: item.isHidden,
         detail: f.detail,
+        finding: f,
       });
     }
   }
 
   container.innerHTML = '';
 
-  const CATEGORY_LABELS = { slop: 'AI tells', quality: 'Quality issues' };
   for (const [catKey, groups] of Object.entries(categories)) {
     if (groups.size === 0) continue;
 
@@ -444,7 +343,7 @@ function renderFindings(findings) {
       <span class="category-count">${catCount}</span>`;
     section.appendChild(catHeader);
 
-    for (const [type, group] of groups) {
+    for (const group of groups.values()) {
     const groupEl = document.createElement('div');
     groupEl.className = 'finding-group';
 
@@ -478,10 +377,9 @@ function renderFindings(findings) {
         <span class="finding-description">${escapeHtml(group.description)}</span>`;
 
       const copyBtn = itemEl.querySelector('.finding-copy');
-      const finding = { type, name: group.name, description: group.description, detail: item.detail };
       copyBtn.addEventListener('click', (e) => {
         e.stopPropagation();
-        copyToClipboard(formatSingleFindingForCopy(item, finding), copyBtn);
+        copyToClipboard(formatSingleFindingForCopy(item, item.finding), copyBtn);
       });
 
       if (!item.isPageLevel && !item.isHidden) {

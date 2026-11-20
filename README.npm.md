@@ -1,43 +1,57 @@
 # Impeccable CLI
 
-Detect UI anti-patterns and design quality issues from the command line. Scans HTML, CSS, JSX, TSX, Vue, and Svelte files for 60 deterministic rules, including AI-generated UI tells, accessibility violations, and general design quality problems.
+Detect UI anti-patterns and design quality issues from the command line, and install the Impeccable design skill into your AI coding harness. The detector scans HTML, CSS, JSX, TSX, Vue, and Svelte files for 62 deterministic rules, including AI-generated UI tells, accessibility violations, and general design quality problems.
+
+The npm package is a small launcher. It runs the `impeccable` engine binary for your platform, installed alongside it as an optional dependency (`@impeccable/cli-<os>-<arch>`), and falls back to a per-user cache or a one-time download when that package is missing.
 
 ## Quick Start
 
 ```bash
 # Install skills into your AI harness (Claude, Cursor, Gemini, etc.)
-npx impeccable skills install
+npx impeccable install
 
 # Non-interactive install for a specific scope
-npx impeccable skills install -y --providers=claude,codex --scope=project
+npx impeccable install -y --providers=claude,codex --scope=project
 
 # First command to run inside your AI harness
 /impeccable init
 
 # Update skills to the latest version
-npx impeccable skills update
+npx impeccable update
 
 # Install or update skills without hook manifests
-npx impeccable skills install --no-hooks
+npx impeccable install --no-hooks
 
 # Link skills from a Git submodule checkout
-npx impeccable skills link --source=.impeccable --providers=claude,cursor
+npx impeccable link --source=.impeccable --providers=claude,cursor
 
 # List all available commands
-npx impeccable skills help
+npx impeccable help
 
 # Scan files or directories for anti-patterns
 npx impeccable detect src/
 
-# Scan a live URL (requires Puppeteer)
+# Scan a live URL (uses an installed Chrome, Chromium, or Edge)
 npx impeccable detect https://example.com
 
 # JSON output for CI/tooling
 npx impeccable detect --json src/
 
-# Deprecated compatibility flag; full scan still runs
-npx impeccable detect --fast src/
+# GitHub Actions annotations
+npx impeccable detect --github src/
+
+# SARIF 2.1.0 for GitHub code scanning, GitLab, or Azure DevOps
+npx impeccable detect --sarif src/ > impeccable.sarif
+
+# Catalog of detector rules (no scan)
+npx impeccable detect --list-rules
+# Inline ignore comments that no longer waive a finding
+npx impeccable detect --report-unused-ignores src/
 ```
+
+Upload that log with `github/codeql-action/upload-sarif` (`sarif_file: impeccable.sarif`, and `category: impeccable` so it sits beside CodeQL); the job needs `security-events: write`. Write it with `npx impeccable detect --sarif src/ > impeccable.sarif || test $? -eq 2` so findings (exit `2`) still upload while an unscannable target (exit `1`) fails the step; that log also says `executionSuccessful: false`. A clean scan still writes a log with an empty `results` array, which is what closes alerts that were fixed. `partialFingerprints.primaryLocationLineHash` is left unset; the upload action fills it.
+
+`npx impeccable skills <command>` is the legacy namespace and still works.
 
 ## What It Detects
 
@@ -56,32 +70,42 @@ npx impeccable detect --fast src/
 
 **Quality**: tiny body text, cramped padding, long line lengths, small touch targets
 
-60 deterministic detector rules in total. See the full catalog at [impeccable.style/slop](https://impeccable.style/slop).
+62 deterministic detector rules in total. See the full catalog at [impeccable.style/slop](https://impeccable.style/slop).
 
 ## Exit Codes
 
-- `0`: no issues found
-- `2`: anti-patterns detected
+- `0`: scan completed with no primary findings (advisories may still be listed)
+- `1`: at least one requested target could not be scanned
+- `2`: scan completed with primary findings
+
+Operational failure takes precedence when a multi-target scan is partial. In JSON mode, stdout remains a findings array and diagnostics are written to stderr. With `--github`, stdout is one GitHub Actions annotation per finding; GitHub displays at most 10 annotations of each type per step and 50 per job, and the rest stay in the log. With `--sarif`, stdout is one SARIF 2.1.0 log, including a clean scan.
 
 ## Options
 
 ```
 impeccable detect [options] [file-or-dir-or-url...]
 
-  --fast    Regex-only mode (skip jsdom, faster but less accurate)
-  --json    Output findings as JSON
-  --help    Show help
+  --json        Output findings as JSON
+  --github      Write GitHub Actions annotations for each finding
+  --sarif       Write a SARIF 2.1.0 log for code scanning
+  --list-rules  Print the detector rule catalog and exit
+  --report-unused-ignores
+                Report inline ignore comments that waived no finding
+  --scope       Only report rules in a design domain (type, layout)
+  --help        Show help
 ```
 
 ## Requirements
 
-- Node.js 22.12+
-- `jsdom` (included as dependency, used for HTML scanning)
-- `puppeteer` (optional, only needed for URL scanning)
+- Node.js 18.19+ to run `npx impeccable`. The engine itself is a self-contained binary and needs no runtime; the skill installed into your harness calls it directly.
+- For URL scans, an installed Chrome, Chromium, or Edge (set `IMPECCABLE_BROWSER` to point at one).
+- Behind a TLS-inspecting proxy, downloads trust your OS certificate store as well as the bundled Mozilla roots. Set `SSL_CERT_FILE` or `SSL_CERT_DIR` to use a specific CA bundle instead.
+
+Binary lookup order: `IMPECCABLE_BIN`, the platform package, `~/.impeccable/bin/<version>/`, then a download of the pinned version into that cache. Set `IMPECCABLE_BIN` to a local build to skip all of that.
 
 ## Part of Impeccable
 
-This CLI is part of [Impeccable](https://impeccable.style), a cross-provider design skill pack for AI-powered development tools. The full suite includes 23 commands for Claude, Cursor, GitHub Copilot, Gemini, Codex, and more.
+This CLI is part of [Impeccable](https://impeccable.style), a cross-provider design skill pack for AI-powered development tools. The full suite includes 24 commands for Claude, Cursor, GitHub Copilot, Gemini, Codex, Hermes Agent, Veto, and more.
 
 ## License
 

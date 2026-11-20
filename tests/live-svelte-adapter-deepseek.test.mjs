@@ -14,6 +14,7 @@ import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { createLlmAgent, resolveLlmAgentConfig } from './live-e2e/agents/llm-agent.mjs';
+import { devEnvView, devKey } from './lib/dev-keys.mjs';
 import { bootFixtureSession, FIXTURES_DIR, REPO_ROOT } from './live-e2e/session.mjs';
 import { runSteerSmoke } from './live-e2e/steer.mjs';
 import { runPreActions } from './live-e2e/preactions.mjs';
@@ -26,8 +27,7 @@ import {
   clickEditCopy,
   clickExitLiveMode,
   clickGo,
-  clickNext,
-  clickPrev,
+  cycleToVariant,
   clickSaveEdit,
   drawAnnotationPinAndStroke,
   editTextLeaf,
@@ -40,6 +40,7 @@ import {
   waitForBarHidden,
   waitForCycling,
   waitForHandshake,
+  waitForVariantSettled,
 } from './live-e2e/ui.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -54,8 +55,8 @@ const artifactRoot = createArtifactRoot();
 let playwright;
 let browser;
 
-if (!process.env.DEEPSEEK_API_KEY) {
-  throw new Error('DEEPSEEK_API_KEY is required. This Svelte adapter sweep must never fall back to fake/mock AI.');
+if (!devKey('DEEPSEEK_API_KEY')) {
+  throw new Error('DEEPSEEK_API_KEY is required (environment or ~/.config/impeccable/dev.env). This Svelte adapter sweep must never fall back to fake/mock AI.');
 }
 
 describe('Svelte live adapter DeepSeek browser sweep', () => {
@@ -70,7 +71,7 @@ describe('Svelte live adapter DeepSeek browser sweep', () => {
 
   it('covers live chrome, replace, edit, annotations, insert, refresh recovery, accept/discard, and exit', async (t) => {
     const fixture = loadConsolidatedFixture();
-    const llmConfig = resolveLlmAgentConfig({ provider: 'deepseek' });
+    const llmConfig = resolveLlmAgentConfig({ provider: 'deepseek' }, devEnvView());
     assert.equal(llmConfig.provider, 'deepseek');
     const agent = await createLlmAgent({
       config: llmConfig,
@@ -179,8 +180,8 @@ function loadConsolidatedFixture() {
       message: 'make the title more direct for the expense dashboard',
       sourceFile: ROUTE_FILE,
       target: { classes: 'hero-title', tag: 'h1' },
-      expectSelector: 'h1.hero-title[data-impeccable-steer="e2e"]',
-      expectSourceContains: 'data-impeccable-steer="e2e"',
+      expectSelector: 'h1.hero-title[data-e2e-steer="e2e"]',
+      expectSourceContains: 'data-e2e-steer="e2e"',
     },
     probe: {
       expectLiveInit: true,
@@ -281,7 +282,7 @@ async function runAnnotationGenerateFlow({ page, tmp, evidence }) {
   const generateEvent = latestJournalEvent(tmp, (event) => event.type === 'generate' && event.screenshotPath);
   await assertAnnotationUploadEvent(generateEvent);
   assert.ok(existsSync(generateEvent.screenshotPath), 'annotation screenshot file exists');
-  await clickNext(page);
+  await cycleTo(page, 2);
   await assertVariantCounter(page, 2, 3);
   await evidence.capture('annotation-cycle');
   await clickDiscard(page);
@@ -504,7 +505,7 @@ async function clickPendingTrash(page) {
     .catch(() => {});
   const clicked = await page.evaluate(() => {
     const dock = window.__impeccableLiveQuery('#impeccable-live-pending-dock');
-    const btn = [...(dock?.querySelectorAll('button') || [])].find((candidate) => /Discard copy edits/i.test(candidate.getAttribute('aria-label') || candidate.title || ''));
+    const btn = [...(dock?.querySelectorAll('button') || [])].find((candidate) => /Discard (copy )?edits/i.test(candidate.getAttribute('aria-label') || candidate.title || ''));
     if (!btn) return false;
     btn.click();
     return true;
@@ -514,14 +515,10 @@ async function clickPendingTrash(page) {
 }
 
 async function cycleTo(page, target) {
-  for (let i = 0; i < 6; i++) {
-    const visible = await getVisibleVariant(page);
-    if (visible === target) return;
-    if (visible == null) await page.waitForTimeout(250);
-    else if (visible < target) await clickNext(page);
-    else await clickPrev(page);
-  }
-  assert.equal(await getVisibleVariant(page), target, `variant ${target} visible`);
+  // Component imports finish after the counter changes. Do not send the next
+  // click (or reload) while the previous variant is still mounting.
+  await cycleToVariant(page, target, 3);
+  await waitForVariantSettled(page, target, 3);
 }
 
 async function waitForVisibleCycling(page, count, { timeout }) {

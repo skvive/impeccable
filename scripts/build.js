@@ -10,21 +10,33 @@
  * - Codex: dist/codex/ only (OpenAI-metadata bundle; not synced to repo root)
  * - Agents: .agents/skills/ (Codex repo/user installs)
  * - GitHub: .github/skills/ (GitHub Copilot)
+ * - Veto: .veto/skills/ (Veto model-routing harness)
  *
  * Also assembles a universal ZIP containing all providers,
  * and builds Tailwind CSS for production deployment.
  */
 
+import { checkTokenBudget } from './lib/token-budget.js';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
-import { readSourceFiles, readPatterns, stashPerProjectArtifacts, restorePerProjectArtifacts } from './lib/utils.js';
+import { readSourceFiles, readPatterns, stashPerProjectArtifacts, restorePerProjectArtifacts, findBatchFilesWithBareLf } from './lib/utils.js';
+import { syncRootCommands } from './lib/root-commands-sync.mjs';
 import { createTransformer, PROVIDERS } from './lib/transformers/index.js';
 import { hooksJsonFor, buildClaudePluginHooksManifest } from './lib/transformers/hooks.js';
 import { createAllZips, createProviderZip } from './lib/zip.js';
 import { collectPluginVersions } from './lib/validate-plugin-versions.js';
+import { collectPluginManifestFindings } from './lib/validate-plugin-manifest.js';
+import {
+  rewritePluginMarkdownTree,
+  rewritePluginAgentMarkdown,
+  verifyPluginSkillRewrite,
+  verifyPluginAgentRewrite,
+} from './lib/plugin-paths.js';
 import { stageOpenAIPlugin } from './lib/openai-plugin.js';
-import { ANTIPATTERNS } from '../cli/engine/registry/antipatterns.mjs';
+import { stageCursorPlugin } from './lib/cursor-plugin.js';
+import { stageVSCodeExtension } from './lib/vscode-extension.js';
+import { ENGINE_TARGETS, binaryName, main as fetchEngineMain, readEngineVersion } from './fetch-engine.mjs';
 // Sub-page generation is now handled by Astro content collections.
 
 /**
@@ -52,13 +64,18 @@ function generateCounts(rootDir, skills, buildDir) {
     commandCount = activeCommands.length;
   }
 
-  // Count detection rules from the detector registry.
-  const detectionCount = new Set(ANTIPATTERNS.map(rule => rule.id)).size;
+  // Count detection rules from the rule registry as `cargo xtask bundle`
+  // emits it. crates/live/assets/antipatterns.json is tracked, so a fresh
+  // checkout has it; extension/detector/antipatterns.json is the gitignored
+  // extension copy and only stands in for an older tree. With neither, the
+  // detection-count check is skipped rather than guessed.
+  const { count: detectionCount, reason: detectionReason } = readDetectionRuleCount(rootDir);
 
   // Validate counts in key files
   const filesToCheck = [
     'site/pages/index.astro',
     'README.md',
+    'README.npm.md',
     'AGENTS.md',
     '.claude-plugin/plugin.json',
     '.claude-plugin/marketplace.json',
@@ -86,9 +103,13 @@ function generateCounts(rootDir, skills, buildDir) {
     // Check for stale detection counts. Use the changelog-stripped content
     // so historical counts in changelog entries (e.g. "28 rules" from an
     // older release) don't flag against the current detector total.
-    const detectPattern = /\b(\d+)\s+(deterministic\s+)?(checks|patterns|rules|detections)/gi;
-    for (const match of strippedContent.matchAll(detectPattern)) {
+    // "detector" as an infix ("60 deterministic detector rules") and
+    // qualified "issues" both evaded the old pattern, which is how five
+    // stale counts shipped while the validator reported clean.
+    const detectPattern = /\b(\d+)\s+(deterministic\s+)?(detector\s+)?(checks|patterns|rules|detections|issues)\b/gi;
+    for (const match of detectionCount == null ? [] : strippedContent.matchAll(detectPattern)) {
       const num = parseInt(match[1]);
+      if (match[4] === 'issues' && !match[2]) continue; // plain "issues" is prose, not a count claim
       if (num !== detectionCount && num > 10) { // ignore small numbers like "3 patterns"
         console.error(`  ❌ ${relPath}: found "${match[0]}" but detection count is ${detectionCount}`);
         errors++;
@@ -100,8 +121,52 @@ function generateCounts(rootDir, skills, buildDir) {
     console.error(`\n❌ ${errors} stale count reference(s) found. Update them to match source of truth.`);
   }
 
-  console.log(`✓ Generated counts: ${commandCount} commands, ${detectionCount} detection rules`);
+  console.log(`✓ Generated counts: ${commandCount} commands, ${detectionCount == null ? `detection rules unchecked: ${detectionReason}` : `${detectionCount} detection rules`}`);
   return errors;
+}
+
+const RULE_REGISTRY_PATHS = [
+  ['crates', 'live', 'assets', 'antipatterns.json'],
+  ['extension', 'detector', 'antipatterns.json'],
+];
+
+/**
+ * The number of distinct rule ids in the registry, or `{ count: null, reason }`
+ * when no location yields one. The reason names the actual condition and the
+ * path it applies to: a registry that is present but unparseable reads very
+ * differently from one that was never generated, and "no antipatterns.json"
+ * for both sends anyone debugging a count failure to the wrong place.
+ */
+function readDetectionRuleCount(rootDir) {
+  const problems = [];
+  for (const parts of RULE_REGISTRY_PATHS) {
+    const rel = parts.join('/');
+    const registry = path.join(rootDir, ...parts);
+    if (!fs.existsSync(registry)) continue;
+    let rules;
+    try {
+      rules = JSON.parse(fs.readFileSync(registry, 'utf-8'));
+    } catch (err) {
+      problems.push(`${rel} is not readable as JSON (${err.message})`);
+      continue;
+    }
+    // Only string ids count. A shape change (a wrapper object, a row without
+    // an id) would otherwise collapse to a Set of one `undefined` and read as
+    // a one-rule registry, which validates every count claim as stale.
+    const ids = (Array.isArray(rules) ? rules : [])
+      .map(rule => rule?.id)
+      .filter(id => typeof id === 'string' && id.length > 0);
+    if (ids.length === 0) {
+      problems.push(`${rel} carries no rule ids`);
+      continue;
+    }
+    return { count: new Set(ids).size };
+  }
+  const where = RULE_REGISTRY_PATHS.map(parts => parts.join('/')).join(' or ');
+  return {
+    count: null,
+    reason: problems.length > 0 ? problems.join('; ') : `no antipatterns.json at ${where}`,
+  };
 }
 
 /**
@@ -133,6 +198,31 @@ function validatePluginVersions(rootDir) {
     console.log(`✓ Plugin/skill versions agree: ${source}`);
   }
   return total;
+}
+
+/**
+ * Guard against unverified plugin manifest shapes (PR #494). The pure check
+ * lives in ./lib/validate-plugin-manifest.js (so it's unit-tested directly);
+ * this wrapper owns the console output and the error count the build gates on.
+ */
+function validatePluginManifestShape(rootDir) {
+  // Source-first builds validate the newly emitted agents; tracked plugin output
+  // is intentionally refreshed only by release/main-sync builds.
+  const findings = collectPluginManifestFindings(rootDir, BUILD_OPTIONS.syncRootOutputs ? {} : {
+    agentsDir: path.join(DIST_DIR, 'claude-code', '.claude', 'agents'),
+  });
+  for (const { relPath, reason } of findings) {
+    console.error(`  ❌ ${relPath}: ${reason}`);
+  }
+  if (findings.length > 0) {
+    console.error(
+      `\n❌ ${findings.length} plugin manifest shape problem(s). Every manifest key is a ` +
+      'claim about the Claude Code loader; see scripts/lib/validate-plugin-manifest.js (PR #494).',
+    );
+  } else {
+    console.log('✓ Plugin manifest shape matches the verified loader contract');
+  }
+  return findings.length;
 }
 
 function validateSkillFrontmatter(skills) {
@@ -345,11 +435,128 @@ function validateSkillProse(rootDir) {
 }
 
 /**
+ * Validate that every `{{ask_instruction}}` interpolation starts a sentence.
+ *
+ * The placeholder's per-provider values are complete capitalized sentences
+ * ("Ask with the AskUserQuestion tool and wait for the answer before continuing."), so a call site that
+ * splices it mid-sentence ships malformed guidance to every provider at once:
+ * `stop and Ask with the AskUserQuestion tool and wait for the answer before
+ * continuing. before expanding it`. Four reference files shipped exactly that before this gate existed, and
+ * a comment in PROVIDER_PLACEHOLDERS asking authors to keep the contract is
+ * what failed to prevent it.
+ *
+ * Returns the number of validation errors. Build fails if > 0.
+ */
+function validateAskInstructionSites(rootDir) {
+  const dir = path.join(rootDir, 'skill', 'reference');
+  const token = '{{ask_instruction}}';
+  let errors = 0;
+  let sites = 0;
+
+  if (!fs.existsSync(dir)) return 0;
+
+  for (const file of fs.readdirSync(dir)) {
+    if (path.extname(file) !== '.md') continue;
+    const rel = path.join('skill/reference', file);
+    fs.readFileSync(path.join(dir, file), 'utf-8')
+      .split('\n')
+      .forEach((line, i) => {
+        let idx = line.indexOf(token);
+        while (idx !== -1) {
+          sites++;
+          // Bold/italic markers may sit between the punctuation and the token.
+          const before = line.slice(0, idx).replace(/[*_`]+\s*$/, '').trimEnd();
+          if (before !== '' && !/[.!?:]$/.test(before)) {
+            console.error(`  ❌ ${rel}:${i + 1}: ${token} is spliced mid-sentence`);
+            console.error(`        ...${before.slice(-60)} ${token}`);
+            console.error(`        Provider values are full sentences. Start a new one.`);
+            errors++;
+          }
+          idx = line.indexOf(token, idx + 1);
+        }
+      });
+  }
+
+  if (errors === 0) {
+    console.log(`✓ ask_instruction call sites: ${sites} sentence-initial`);
+  } else {
+    console.error(`\n❌ ${errors} of ${sites} {{ask_instruction}} site(s) spliced mid-sentence.`);
+  }
+  return errors;
+}
+
+/**
+ * Validate that Claude Code's description still fits its skill-listing budget.
+ *
+ * Claude Code lists a non-bundled skill by its bare name when the listing is
+ * over budget (1% of the context window in characters: 6,000 on a 200k model)
+ * and the description doesn't fit in what the bundled skills leave. Measured on
+ * Claude Code 2.1.281: about 220 characters survives beside its default bundled
+ * skills, 225 does not (tests/skill-behavior/README.md). The cap keeps headroom
+ * under that, so a longer draft fails here rather than vanishing for users.
+ *
+ * Returns the number of validation errors. Build fails if > 0.
+ */
+const CLAUDE_CODE_DESCRIPTION_MAX = 200;
+/**
+ * Token budget: every LLM-facing skill file and each common use's up-front
+ * load stay under the caps in scripts/token-budget.json.
+ *
+ * Returns the number of validation errors. Build fails if > 0.
+ */
+function validateTokenBudget(rootDir) {
+  const { errors, rows } = checkTokenBudget(rootDir);
+  for (const e of errors) console.error(`  ❌ ${e}`);
+  if (!errors.length) console.log(`✓ Token budget: ${rows.join('; ')}`);
+  return errors.length;
+}
+
+function validateClaudeCodeDescription(rootDir) {
+  const src = fs.readFileSync(path.join(rootDir, 'skill', 'SKILL.src.md'), 'utf-8');
+  const m = src.match(/^claude-code-description:\s*"(.*)"\s*$/m);
+  if (!m) {
+    console.error('  ❌ skill/SKILL.src.md has no claude-code-description; Claude Code would list the shared description, which is over its budget');
+    return 1;
+  }
+  if (m[1].length > CLAUDE_CODE_DESCRIPTION_MAX) {
+    console.error(`  ❌ claude-code-description is ${m[1].length} characters; Claude Code's skill listing drops it above about 220, and the cap is ${CLAUDE_CODE_DESCRIPTION_MAX}`);
+    return 1;
+  }
+  console.log(`✓ claude-code-description: ${m[1].length} of ${CLAUDE_CODE_DESCRIPTION_MAX} characters`);
+  return 0;
+}
+
+/**
  * Validate that every hand-authored HTML page carries the shared site header.
  * The partial is stamped with `<!-- site-header v1 -->` so drift is loud.
  *
  * Returns the number of validation errors. Build fails if > 0.
  */
+/**
+ * Every shipped `impeccable.cmd` must have CRLF line endings: cmd.exe cannot
+ * find `call :label` targets in an LF-only batch file (#1098). The build
+ * writes CRLF itself (readSkillScripts), so a failure here means that
+ * guarantee regressed. Checks dist/ (the release zips are packed from it)
+ * and, on a release build, the tracked harness dirs and plugin subtrees.
+ *
+ * Returns the number of validation errors. Build fails if > 0.
+ */
+function validateBatchLineEndings(rootDir, distDir, { syncRootOutputs }) {
+  const dirs = [distDir];
+  if (syncRootOutputs) {
+    for (const { configDir } of Object.values(PROVIDERS)) {
+      dirs.push(path.join(rootDir, configDir, 'skills', 'impeccable'));
+    }
+    dirs.push(path.join(rootDir, 'plugin'), path.join(rootDir, 'cursor-plugin'));
+  }
+  const bad = findBatchFilesWithBareLf([...new Set(dirs)]);
+  for (const file of bad) {
+    console.error(`❌ ${path.relative(rootDir, file)} has LF line endings; cmd.exe needs CRLF in a batch file (#1098).`);
+  }
+  if (bad.length === 0) console.log('✓ Batch launchers ship with CRLF line endings');
+  return bad.length;
+}
+
 function copyDirSync(src, dest) {
   fs.mkdirSync(dest, { recursive: true });
   const entries = fs.readdirSync(src, { withFileTypes: true });
@@ -403,12 +610,74 @@ function syncRootHookManifests(rootDir) {
     const manifest = hooksJsonFor(config.emitHooks, { configDir: config.configDir });
     if (!manifest) continue;
     const rel = config.hooksManifestRel || path.join('hooks', 'hooks.json');
-    const dest = path.join(rootDir, config.configDir, rel);
+    const dir = config.hooksManifestDir || config.configDir;
+    const dest = path.join(rootDir, dir, rel);
     fs.mkdirSync(path.dirname(dest), { recursive: true });
     fs.writeFileSync(dest, JSON.stringify(manifest, null, 2) + '\n');
-    synced.push(path.join(config.configDir, rel).split(path.sep).join('/'));
+    synced.push(path.join(dir, rel).split(path.sep).join('/'));
   }
   return synced;
+}
+
+function syncRootPluginPayloads(distDir, rootDir) {
+  const synced = [];
+  for (const config of Object.values(PROVIDERS)) {
+    if (!config.pluginPayload) continue;
+    const src = path.join(distDir, config.provider, config.configDir, config.pluginPayload.dest);
+    if (!fs.existsSync(src)) continue;
+    mirrorDirContentsSync(src, path.join(rootDir, config.configDir, config.pluginPayload.dest));
+    synced.push(path.join(config.configDir, config.pluginPayload.dest).split(path.sep).join('/'));
+  }
+  return synced;
+}
+
+/**
+ * Every skill copy in dist gets the engine binaries the launcher looks for
+ * (`scripts/bin/<os>-<arch>/impeccable[.exe]`), so the release zips are
+ * self-contained for installs without egress. Opt-in only
+ * (IMPECCABLE_BUNDLE_ENGINE=1 on a release build), and only after the root
+ * harness dirs and ./plugin have been synced from dist: those are
+ * git-delivered and must stay launcher-only (the binaries are gitignored and
+ * the launcher downloads them on first run).
+ *
+ * Source: skill/scripts/bin/, filled by scripts/fetch-engine.mjs --all. A
+ * target that could not be fetched is reported and left out; the launcher
+ * covers it at run time.
+ */
+async function stageEngineBinaries(rootDir, distDir) {
+  await fetchEngineMain(['--all', '--lenient']);
+  const binRoot = path.join(rootDir, 'skill', 'scripts', 'bin');
+  const present = ENGINE_TARGETS.filter(t => fs.existsSync(path.join(binRoot, t, binaryName(t))));
+  const missing = ENGINE_TARGETS.filter(t => !present.includes(t));
+  if (present.length === 0) {
+    console.warn(`⚠️  No engine binaries for v${readEngineVersion(rootDir)}; zips ship launcher-only (the launcher downloads on first run).`);
+    return;
+  }
+  let copies = 0;
+  for (const { provider, configDir } of Object.values(PROVIDERS)) {
+    const scriptsDir = path.join(distDir, provider, configDir, 'skills', 'impeccable', 'scripts');
+    if (!fs.existsSync(scriptsDir)) continue;
+    for (const target of present) {
+      const src = path.join(binRoot, target, binaryName(target));
+      const dest = path.join(scriptsDir, 'bin', target, binaryName(target));
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      fs.copyFileSync(src, dest);
+      fs.chmodSync(dest, 0o755);
+      copies++;
+    }
+  }
+  console.log(`✓ Staged engine v${readEngineVersion(rootDir)} binaries into dist (${present.join(', ')}; ${copies} copies)${missing.length ? `; missing: ${missing.join(', ')}` : ''}`);
+}
+
+function syncEngineVersionFile(rootDir) {
+  const version = readEngineVersion(rootDir);
+  if (!/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(version)) {
+    throw new Error(`ENGINE_VERSION must be a semver string, got "${version}"`);
+  }
+  const dest = path.join(rootDir, 'skill', 'scripts', 'VERSION');
+  const current = fs.existsSync(dest) ? fs.readFileSync(dest, 'utf-8') : null;
+  if (current !== `${version}\n`) fs.writeFileSync(dest, `${version}\n`);
+  console.log(`✓ Engine pinned at v${version} (skill/scripts/VERSION)`);
 }
 
 const __filename = fileURLToPath(import.meta.url);
@@ -448,6 +717,18 @@ function assembleUniversal(distDir) {
     }
   }
 
+  // A hook manifest the harness reads from outside its configDir
+  // (Antigravity: `.agents/hooks.json`) is copied on its own, after every
+  // provider dir, so it lands where the harness looks.
+  for (const { provider, hooksManifestDir, hooksManifestRel } of providerConfigs) {
+    if (!hooksManifestDir || !hooksManifestRel) continue;
+    const src = path.join(distDir, provider, hooksManifestDir, hooksManifestRel);
+    if (!fs.existsSync(src)) continue;
+    const dest = path.join(universalDir, hooksManifestDir, hooksManifestRel);
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    fs.copyFileSync(src, dest);
+  }
+
   // Add a visible README so macOS users don't see an empty folder
   // (all provider dirs are dotfiles, hidden by default in Finder)
   fs.writeFileSync(path.join(universalDir, 'README.txt'),
@@ -458,18 +739,24 @@ This folder contains skills for all supported tools:
 
   .cursor/    -> Cursor
   .claude/    -> Claude Code
+  .devin/     -> Devin
+  .dsh/       -> DeepSeek Harness
   .gemini/    -> Gemini CLI
   .codex/     -> Codex custom agents (Codex skills use .agents/)
-  .agents/    -> Codex CLI
+  .agents/    -> Codex CLI (and hooks.json, the Antigravity design hook)
+  .agent/     -> Antigravity
   .github/    -> GitHub Copilot
   .grok/      -> Grok Build
+  .hermes/    -> Hermes Agent
   .kiro/      -> Kiro
   .opencode/  -> OpenCode
   .pi/        -> Pi
+  .omp/       -> Oh My Pi
   .trae-cn/   -> Trae China
   .trae/      -> Trae International
   .rovodev/   -> Rovo Dev
   .vibe/      -> Mistral Vibe
+  .veto/      -> Veto model-routing harness
   .qoder/     -> Qoder
 
 To install, copy the relevant folder(s) into your project root.
@@ -502,6 +789,10 @@ async function build() {
 
   const buildDir = path.join(ROOT_DIR, 'build');
 
+  // The launcher reads scripts/VERSION to know which engine release to run
+  // or download; the root ENGINE_VERSION file is the source of truth for it.
+  syncEngineVersionFile(ROOT_DIR);
+
   // Read source files (unified skills architecture)
   const { skills } = readSourceFiles(ROOT_DIR);
   const patterns = readPatterns(ROOT_DIR);
@@ -522,13 +813,6 @@ async function build() {
     const transform = createTransformer(config);
     transform(skills, DIST_DIR, { skillsVersion });
   }
-
-  // Assemble universal directory
-  assembleUniversal(DIST_DIR);
-
-  // Create ZIP bundles (individual + universal)
-  await createAllZips(DIST_DIR);
-
 
   if (BUILD_OPTIONS.syncRootOutputs) {
     // Copy all provider outputs to project root for direct GitHub installs and
@@ -569,9 +853,19 @@ async function build() {
       }
     }
 
+    const syncedCommands = syncRootCommands(DIST_DIR, ROOT_DIR, syncConfigs);
+    if (syncedCommands.length > 0) {
+      console.log(`📟 Synced provider commands to: ${syncedCommands.join(', ')}`);
+    }
+
     const syncedHooks = syncRootHookManifests(ROOT_DIR);
     if (syncedHooks.length > 0) {
       console.log(`🪝 Synced hook manifests to: ${syncedHooks.join(', ')}`);
+    }
+
+    const syncedPlugins = syncRootPluginPayloads(DIST_DIR, ROOT_DIR);
+    if (syncedPlugins.length > 0) {
+      console.log(`🪝 Synced provider plugins to: ${syncedPlugins.join(', ')}`);
     }
 
     // Remove deprecated skill stubs from local harness dirs. They exist
@@ -621,22 +915,18 @@ async function build() {
 
     const rootManifest = JSON.parse(fs.readFileSync(path.join(ROOT_DIR, '.claude-plugin/plugin.json'), 'utf-8'));
     const claudeAgentsSrc = path.join(DIST_DIR, 'claude-code', '.claude', 'agents');
-    const pluginAgentEntries = fs.existsSync(claudeAgentsSrc)
-      ? fs.readdirSync(claudeAgentsSrc)
-          .filter(file => file.endsWith('.md'))
-          .sort()
-          .map(file => `./agents/${file}`)
-      : [];
     // Trailing slash on the skills path matches the documented schema in
     // code.claude.com/docs/en/plugins-reference. Issue #86 has 3 reporters
     // converging on "add trailing slash to fix slash commands not registering";
     // the docs schema example consistently uses `"./custom/skills/"` form.
     const pluginManifest = { ...rootManifest, skills: './skills/' };
-    if (pluginAgentEntries.length) {
-      pluginManifest.agents = pluginAgentEntries;
-    } else {
-      delete pluginManifest.agents;
-    }
+    // No `agents` key: Claude Code discovers agents/*.md by itself, and the
+    // identifier it uses is the file name. Declaring the key as an array of
+    // file paths makes it load ZERO agents, so the four shipped subagents were
+    // never reachable. The other plausible shapes are worse: a string, or an
+    // array containing a directory, and the whole plugin fails to load.
+    // Omitting the key is the only shape that works.
+    delete pluginManifest.agents;
     fs.mkdirSync(pluginManifestDir, { recursive: true });
     fs.writeFileSync(
       path.join(pluginManifestDir, 'plugin.json'),
@@ -673,6 +963,21 @@ async function build() {
       copyDirSync(claudeAgentsSrc, pluginAgentsDir);
     }
 
+    // The claude-code output resolves {{scripts_path}} to a project-relative
+    // path. Inside the plugin cache that path points into the user's project,
+    // so a dual install silently runs the project's older skill copy (issue
+    // #523). Rewrite the copied markdown to the skill-base-dir form.
+    rewritePluginMarkdownTree(pluginSkillsDir);
+    // Agents get the plugin-root variable, not the skill-base-dir token:
+    // a spawned agent never loads SKILL.md, so the token is undefined there.
+    rewritePluginMarkdownTree(pluginAgentsDir, rewritePluginAgentMarkdown);
+    verifyPluginSkillRewrite(path.join(pluginSkillsDir, 'impeccable', 'SKILL.md'));
+    if (fs.existsSync(pluginAgentsDir)) {
+      for (const agentFile of fs.readdirSync(pluginAgentsDir)) {
+        if (agentFile.endsWith('.md')) verifyPluginAgentRewrite(path.join(pluginAgentsDir, agentFile));
+      }
+    }
+
     // Ship the design detector as a plugin-packaged hook. Claude Code and
     // Grok Build both auto-discover `hooks/hooks.json` at the plugin root
     // (Grok aliases CLAUDE_PLUGIN_ROOT → GROK_PLUGIN_ROOT), so marketplace /
@@ -695,12 +1000,45 @@ async function build() {
   const openAiPluginRoot = stageOpenAIPlugin(ROOT_DIR, DIST_DIR);
   await createProviderZip(openAiPluginRoot, DIST_DIR, 'openai-plugin');
 
+  const cursorPluginRoot = stageCursorPlugin(ROOT_DIR, DIST_DIR);
+  if (BUILD_OPTIONS.syncRootOutputs) {
+    const destination = path.join(ROOT_DIR, 'cursor-plugin');
+    fs.rmSync(destination, { recursive: true, force: true });
+    fs.cpSync(cursorPluginRoot, destination, { recursive: true });
+  }
+
+  // Declarative Marketplace skill bundle: no editor runtime or project hooks.
+  // Staged before optional engine bundling to keep the VSIX launcher-only.
+  stageVSCodeExtension(ROOT_DIR, DIST_DIR);
+
+  // Release zips ship launcher-only by default: the launcher downloads the
+  // pinned engine on first run. IMPECCABLE_BUNDLE_ENGINE=1 opts in to staging
+  // every fetched target into every dist skill copy for offline installs.
+  // That was the default once and put universal.zip at ~340 MB (five targets
+  // times every provider copy), past the 25 MB Cloudflare Pages file cap that
+  // `impeccable install` downloads through. Staging runs after the root
+  // harness dirs, ./plugin, and the OpenAI plugin were staged from dist, so
+  // git-delivered trees stay launcher-only either way.
+  if (BUILD_OPTIONS.syncRootOutputs && process.env.IMPECCABLE_BUNDLE_ENGINE === '1') {
+    await stageEngineBinaries(ROOT_DIR, DIST_DIR);
+  }
+
+  // Assemble universal directory
+  assembleUniversal(DIST_DIR);
+
+  // Create ZIP bundles (universal)
+  await createAllZips(DIST_DIR);
+
   // Generate authoritative counts and validate references
   const countErrors = generateCounts(ROOT_DIR, skills, buildDir);
 
   // Guard plugin/skill version drift: marketplace + ./plugin subtree must
   // match root plugin.json so marketplace installs never ship a stale version.
   const versionErrors = validatePluginVersions(ROOT_DIR);
+
+  // Guard the generated plugin manifest's shape: a key the Claude Code loader
+  // does not honor (like the agents array, PR #494) ships silently broken.
+  const manifestShapeErrors = validatePluginManifestShape(ROOT_DIR);
 
   // Scan user-facing copy for AI tells (em dashes, marketing fluff, denylisted phrases)
   const proseErrors = validateProse(ROOT_DIR);
@@ -709,7 +1047,20 @@ async function build() {
   // that has no technical reading. Hardening repetition is intentionally allowed.
   const skillProseErrors = validateSkillProse(ROOT_DIR);
 
-  if (countErrors > 0 || versionErrors > 0 || proseErrors > 0 || skillProseErrors > 0) {
+  // Placeholder values are full sentences; a mid-sentence splice ships broken
+  // guidance to every provider at once.
+  const askSiteErrors = validateAskInstructionSites(ROOT_DIR);
+
+  // Claude Code drops a description that outgrows its skill-listing budget.
+  const claudeDescriptionErrors = validateClaudeCodeDescription(ROOT_DIR);
+
+  // cmd.exe misparses an LF-only batch file, so every emitted .cmd is CRLF.
+  const batchEolErrors = validateBatchLineEndings(ROOT_DIR, DIST_DIR, BUILD_OPTIONS);
+
+  // What the skill loads into an agent's context stays under its byte caps.
+  const tokenBudgetErrors = validateTokenBudget(ROOT_DIR);
+
+  if (countErrors > 0 || versionErrors > 0 || manifestShapeErrors > 0 || proseErrors > 0 || skillProseErrors > 0 || askSiteErrors > 0 || claudeDescriptionErrors > 0 || batchEolErrors > 0 || tokenBudgetErrors > 0) {
     process.exit(1);
   }
 

@@ -5,17 +5,17 @@
  * where the accepted source has been carbonized cleanly but the browser still
  * exposes the accepted element under stale data-impeccable runtime wrappers.
  *
- * Run with:
- *   set -a; source .env.local; set +a
+ * Run with (keys from the environment or ~/.config/impeccable/dev.env):
  *   node --test --test-timeout=600000 tests/live-e2e-accept-cleanup-regression.test.mjs
  */
 
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { extname, join } from 'node:path';
 
 import { createLlmAgent, resolveLlmAgentConfig } from './live-e2e/agents/llm-agent.mjs';
+import { devEnvView } from './lib/dev-keys.mjs';
 import { bootFixtureSession, FIXTURES_DIR } from './live-e2e/session.mjs';
 import { runSteerSmoke } from './live-e2e/steer.mjs';
 import { runPreActions, waitForCyclingRobust } from './live-e2e/preactions.mjs';
@@ -27,8 +27,6 @@ import {
   pickElement,
   waitForHandshake,
 } from './live-e2e/ui.mjs';
-
-loadEnvLocal();
 
 const FIXTURE_NAME = 'vite8-react-plain';
 const PICK_SELECTOR = 'h1.hero-title';
@@ -51,7 +49,7 @@ describe('live-e2e accept cleanup regression', () => {
     const fixture = readFixture(FIXTURE_NAME);
     const llmConfig = resolveLlmAgentConfig({
       provider: process.env.IMPECCABLE_E2E_LLM_PROVIDER || 'deepseek',
-    });
+    }, devEnvView());
     const agent = await createLlmAgent({
       config: llmConfig,
       log: (msg) => t.diagnostic('[llm] ' + msg),
@@ -70,7 +68,7 @@ describe('live-e2e accept cleanup regression', () => {
       log: (msg) => t.diagnostic(msg),
     });
 
-    const { page, tmp, teardown } = session;
+    const { page, tmp, appRoot, teardown } = session;
     try {
       t.diagnostic(`Using LLM agent (provider=${llmConfig.provider} model=${llmConfig.model})`);
       await waitForHandshake(page);
@@ -104,6 +102,10 @@ describe('live-e2e accept cleanup regression', () => {
       await clickNext(page);
       assert.equal(await getVisibleVariant(page), 2, 'variant 2 visible after one Next');
 
+      const saved = await page.evaluate(() => JSON.parse(localStorage.getItem('impeccable-live-session') || 'null'));
+      assert.ok(saved?.id && /^[a-zA-Z0-9_-]+$/.test(saved.id), 'cycling session has a safe durable id');
+      const snapshotPath = join(appRoot, '.impeccable/live/sessions', `${saved.id}.snapshot.json`);
+
       t.diagnostic('Accepting variant 2');
       await clickAccept(page, { expectedVariant: 2 });
 
@@ -120,6 +122,19 @@ describe('live-e2e accept cleanup regression', () => {
         sourceFile,
         finalSource,
       });
+
+      // Source/DOM cleanup can precede live-complete, or succeed while its
+      // durable acknowledgement fails. Do not count that as a finished accept.
+      const deadline = Date.now() + 30_000;
+      let snapshot;
+      do {
+        snapshot = JSON.parse(readFileSync(snapshotPath, 'utf8'));
+        if (snapshot.phase === 'completed') break;
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      } while (Date.now() < deadline);
+      assert.equal(snapshot.phase, 'completed', 'accept must reach durable completed phase without forcing completion');
+      assert.doesNotMatch(readFileSync(sourceFile, 'utf8'), /data-impeccable-[\w-]+\s*=/, 'accepted source contains no reserved runtime attributes');
+      t.diagnostic(`Durable completion verified for ${saved.id}`);
     } finally {
       await teardown();
     }
@@ -128,31 +143,6 @@ describe('live-e2e accept cleanup regression', () => {
 
 function readFixture(name) {
   return JSON.parse(readFileSync(join(FIXTURES_DIR, name, 'fixture.json'), 'utf-8'));
-}
-
-function loadEnvLocal() {
-  const envPath = join(process.cwd(), '.env.local');
-  if (!existsSync(envPath)) return;
-  const body = readFileSync(envPath, 'utf-8');
-  for (const line of body.split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('#')) continue;
-    const match = trimmed.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
-    if (!match) continue;
-    const [, key, rawValue] = match;
-    if (process.env[key]) continue;
-    process.env[key] = unquoteEnvValue(rawValue.trim());
-  }
-}
-
-function unquoteEnvValue(value) {
-  if (
-    (value.startsWith('"') && value.endsWith('"'))
-    || (value.startsWith("'") && value.endsWith("'"))
-  ) {
-    return value.slice(1, -1);
-  }
-  return value;
 }
 
 function wrapTargetFromPickedElement(event) {
